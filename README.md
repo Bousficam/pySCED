@@ -37,6 +37,10 @@ functions in `functions/`. Detailed methodological documentation:
 [`templates/analyses/sced/METHODS.md`](templates/analyses/sced/METHODS.md) and
 [`templates/analyses/sced/FLOWCHARTS.md`](templates/analyses/sced/FLOWCHARTS.md).
 
+SCED design families covered:
+
+![SCED design families: phase/reversal, ATD, multiple-baseline, changing-criterion](docs/figures/sced_designs.png)
+
 ---
 
 ## Axis 1 - Alternating design (ATD): permutation principle, ANOVA / ANCOVA
@@ -56,6 +60,14 @@ reshuffle the admissible labels and recompute a statistic.
   Reference GLM-permutation framework: Winkler et al. 2014.
 - **Spatial or network outcome** (connectome, EEG): the same permuted ANCOVA is
   carried by a cluster-mass statistic or an NBS (`sced/cluster/`).
+
+Label-permutation randomization test (block ATD), and its link to Draper-Stoneman / Freedman-Lane:
+
+![ATD label-permutation randomization test: observed data, one admissible reshuffle, the block scheme, and the exact null distribution](docs/figures/atd_label_permutation.png)
+
+Overlap effect sizes reported alongside the test (NAP is the benchmarked one for alternation):
+
+![NAP and Tau overlap effect sizes](docs/figures/nap_tau.png)
 
 Key functions: `randomization_test`, `diff_in_means`, `omnibus_variance`,
 `condition_permutation_test` (ANCOVA), `choose_permutation_method` (DS vs FL),
@@ -81,6 +93,18 @@ routes.
   `b2`, slope change `b3`) with within-case AR(1), per-case and population-level
   effects, and model comparison (PSIS-LOO / canonical comparators) to identify
   the assumed effect shape.
+
+Start-point randomization schemes (MB, MB-R, Wampold-Worsham, Koehler-Levin, Revusky):
+
+![MBD randomization schemes: staggered onsets, the MB independent-window scheme, the WW reassignment scheme, and the exact null](docs/figures/mbd_randomization_schemes.png)
+
+Baseline-corrected Tau (Tarlow), when a baseline trend must be removed before scoring overlap:
+
+![Baseline-corrected Tau: raw vs trend-corrected](docs/figures/tau_correction.png)
+
+Bayesian route: posterior proportional to prior times likelihood, with HDI / ROPE / pd decision:
+
+![Bayesian principle: posterior, sequential updating, HDI/ROPE/pd, role of the prior](docs/figures/bayesian_principle.png)
 
 Key functions: `multiple_baseline_test`, `pipeline_sced_multiple_baseline`,
 `choose_mbd_procedure`, `bayes_hier_sced`, `multilevel_mbd_model`,
