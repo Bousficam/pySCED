@@ -108,21 +108,32 @@ The MBD randomization test itself: staggered onsets, the scheme, and the exact n
 
 ### Piecewise model (effect modeling)
 
-The Bayesian piecewise multilevel model estimates, per case and at population
-level (Moeyaert, Ferron, Beretvas & Van den Noortgate 2014):
+The piecewise multilevel model (Moeyaert, Ferron, Beretvas & Van den Noortgate
+2014) specifies the mean structure:
 
 ```
 Y = b0 + b1*time + b2*phase + b3*(treatment trajectory) + random effects + e
 ```
 
 with `b0` intercept, `b1` baseline trend, `b2` immediate level change at onset,
-`b3` slope change after onset. The mixed model supplies the estimates; the
-small-sample-valid p-values come from the design-based randomization test
-(`p_level_change_perm`, `p_slope_change_perm`), not the model asymptotics
-(Manolov & Moeyaert 2017).
+`b3` slope change after onset. The treatment trajectory is either a single
+sustained slope (continuous) or a ramp that rises over the first few treatment
+sessions then plateaus (two-piece; Cheng et al. 2025), in which case `b2` is the
+stabilised plateau effect and `b3` the initial rise. Two estimation routes share
+this structure:
 
-`compare_sced_models` compares nested mean structures by PSIS-LOO / WAIC (Vehtari
-et al. 2017), with stacking and pseudo-BMA+ weights:
+- **Frequentist mixed model** (`multilevel_mbd_model`): point estimates of
+  `b1` / `b2` / `b3` and variance components. With the few cases typical of MBD the
+  model's asymptotic p is untrustworthy, so significance comes from the
+  design-based randomization test (`p_level_change_perm`, `p_slope_change_perm`)
+  or a Kenward-Roger correction (Manolov & Moeyaert 2017).
+- **Bayesian hierarchical** (`bayes_hier_sced`): posteriors for `b1` / `b2` / `b3`,
+  per case and at population level, with HDI / ROPE / pd, within-case AR(1) and
+  partial pooling.
+
+The Bayesian route also compares effect shapes: `compare_sced_models` scores
+nested mean structures by PSIS-LOO (Vehtari, Gelman & Gabry 2017) and WAIC
+(Watanabe 2010), with stacking (Yao et al. 2018) and pseudo-BMA+ weights:
 
 | Model | Terms | Effect shape |
 |---|---|---|
@@ -174,10 +185,3 @@ Templates:
 - [`template_suivi_multi_temps.py`](templates/analyses/general/template_suivi_multi_temps.py) - multi-timepoint follow-up
 - [`template_longitudinal_growth.py`](templates/analyses/general/template_longitudinal_growth.py) - growth curves
 - [`template_donnees_manquantes_imputation.py`](templates/analyses/general/template_donnees_manquantes_imputation.py) - missing data / imputation
-
----
-
-## Style
-
-ASCII output, neutral tone. No em dash (U+2014) or en dash (U+2013): plain hyphen
-or rephrase.
