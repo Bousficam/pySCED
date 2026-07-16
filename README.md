@@ -69,6 +69,10 @@ Overlap effect sizes reported alongside the test (NAP is the benchmarked one for
 
 ![NAP and Tau overlap effect sizes](docs/figures/nap_tau.png)
 
+Baseline-corrected Tau (Tarlow), when a baseline trend must be removed before scoring overlap:
+
+![Baseline-corrected Tau: raw vs trend-corrected](docs/figures/tau_correction.png)
+
 Key functions: `randomization_test`, `diff_in_means`, `omnibus_variance`,
 `condition_permutation_test` (ANCOVA), `choose_permutation_method` (DS vs FL),
 `huh_jhun_test`, `run_ancova`, `report_sced_cluster`.
@@ -89,22 +93,47 @@ routes.
   (MB, MB-R, Wampold-Worsham, Koehler-Levin, Revusky), with procedure choice
   driven by the number of units and the stagger constraint. Statistics: level
   difference, ITEI (immediate effect), Tau-U.
-- **Piecewise Bayesian**: hierarchical segmented model (level `b1`, level shift
-  `b2`, slope change `b3`) with within-case AR(1), per-case and population-level
-  effects, and model comparison (PSIS-LOO / canonical comparators) to identify
-  the assumed effect shape.
+- **Piecewise Bayesian**: hierarchical segmented model (baseline trend `b1`,
+  immediate level change `b2`, slope change `b3`) with within-case AR(1), per-case
+  and population-level effects, and model comparison (PSIS-LOO / canonical
+  comparators) to identify the effect shape.
 
-Start-point randomization schemes (MB, MB-R, Wampold-Worsham, Koehler-Levin, Revusky):
+Start-point randomization schemes for staggered onsets (MB, MB-R, Wampold-Worsham, Koehler-Levin, Revusky):
 
-![MBD randomization schemes: staggered onsets, the MB independent-window scheme, the WW reassignment scheme, and the exact null](docs/figures/mbd_randomization_schemes.png)
+![MBD randomization schemes overview](docs/figures/mbd_schemes_all.png)
 
-Baseline-corrected Tau (Tarlow), when a baseline trend must be removed before scoring overlap:
+The MBD randomization test itself: staggered onsets, the scheme, and the exact null distribution:
 
-![Baseline-corrected Tau: raw vs trend-corrected](docs/figures/tau_correction.png)
+![MBD randomization test: staggered onsets, the MB independent-window scheme, the WW reassignment scheme, and the exact null](docs/figures/mbd_randomization_schemes.png)
 
-Bayesian route: posterior proportional to prior times likelihood, with HDI / ROPE / pd decision:
+### Piecewise model (effect modeling)
 
-![Bayesian principle: posterior, sequential updating, HDI/ROPE/pd, role of the prior](docs/figures/bayesian_principle.png)
+The Bayesian piecewise multilevel model estimates, per case and at population
+level (Moeyaert, Ferron, Beretvas & Van den Noortgate 2014):
+
+```
+Y = b0 + b1*time + b2*phase + b3*(treatment trajectory) + random effects + e
+```
+
+with `b0` intercept, `b1` baseline trend, `b2` immediate level change at onset,
+`b3` slope change after onset. The mixed model supplies the estimates; the
+small-sample-valid p-values come from the design-based randomization test
+(`p_level_change_perm`, `p_slope_change_perm`), not the model asymptotics
+(Manolov & Moeyaert 2017).
+
+`compare_sced_models` compares nested mean structures by PSIS-LOO / WAIC (Vehtari
+et al. 2017), with stacking and pseudo-BMA+ weights:
+
+| Model | Terms | Effect shape |
+|---|---|---|
+| M0 | `b1` only | no effect (baseline trend only) |
+| Mi | `b1 + b2` | immediate level jump |
+| Mg | `b1 + b3` | gradual (slope) effect, no jump |
+| Mf | `b1 + b2 + b3` | jump + slope change |
+
+Interpretation: the model favored by LOO identifies the effect shape (decisive
+only if `elpd_diff > 2*dse`, otherwise indistinguishable, keep the simplest or the
+model-averaged effect). Read `b2` / `b3` in outcome units with HDI / ROPE / pd.
 
 Key functions: `multiple_baseline_test`, `pipeline_sced_multiple_baseline`,
 `choose_mbd_procedure`, `bayes_hier_sced`, `multilevel_mbd_model`,
