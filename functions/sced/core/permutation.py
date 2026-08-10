@@ -973,6 +973,155 @@ def randomization_test(labels, values, *, statistic, scheme, n_perm=5000,
             "n_perm": int(n_valid), "two_sided": bool(two_sided)}
 
 
+def frozen_sd_statistic(values, treated, *, standardize=True):
+    """Mean-difference statistic whose standardizing SD is FROZEN on the observed data.
+
+    In : the observed ``values`` and a boolean mask of the treated observations. Out : a callable
+    ``statistic(labels_mask, values) -> float`` usable by ``randomization_test`` and
+    ``randomization_interval``. No side effect.
+
+    WHY THE SD MUST BE FROZEN. Inverting a test means re-running it on data from which a candidate
+    effect has been subtracted. If the standardizing SD is recomputed on those shifted data, it
+    GROWS with the candidate, the reference distribution is rescaled candidate by candidate, and
+    the interval is judged against a moving yardstick - Michiels et al. (2017, p. 368) : the SD
+    "is the standard deviation of all observed data before Delta is subtracted and is thus a
+    constant for the calculation of the test statistic for each assignment and for each tested
+    Delta", because the unit-treatment additivity model has no variance parameter to move.
+
+    ``standardize=False`` returns the raw mean difference, for which the question does not arise.
+    """
+    sd = float(np.std(np.asarray(values, float), ddof=1)) if standardize else 1.0
+    sd = sd if sd > 0 else 1.0
+
+    def statistic(mask, v):
+        m = np.asarray(mask, bool)
+        v = np.asarray(v, float)
+        if m.all() or not m.any():
+            return float("nan")
+        return float((v[m].mean() - v[~m].mean()) / sd)
+
+    statistic.frozen_sd = sd
+    return statistic
+
+
+def randomization_interval(labels, values, *, statistic, scheme, treated, confidence=0.95,
+                           n_perm=2000, random_state=0, precision=1e-3, max_expand=40,
+                           max_iter=60, block_size=None, max_consecutive=None):
+    """Confidence interval by RANDOMIZATION TEST INVERSION (Michiels et al. 2017).
+
+    In : the observed ``labels`` (whatever ``scheme`` and ``statistic`` expect), the ``values``, the
+    test statistic, the randomization ``scheme``, and ``treated``, a boolean mask of the
+    observations the treatment applies to. Out : ``{estimate, ci_low, ci_high, confidence, p_value,
+    n_perm, m_t, p_floor, effect_model, note}``. Side effect : none.
+
+    THE PRINCIPLE. A two-sided level-alpha test and a 100(1 - alpha)% interval are the same object
+    read twice : the interval is the set of point null values the test does NOT reject
+    (Neyman 1937). So one tests a range of candidate effects and keeps the survivors -
+    Michiels et al. (2017, p. 365).
+
+    THE EFFECT MODEL, which is the price of an interval. Testing "the effect equals Delta" requires
+    reconstructing the data as they would be under that hypothesis. Here the unit-treatment
+    additivity model is used : the treatment shifts every treated score by a constant, so the null
+    data are ``values - Delta`` on the treated observations - (p. 368). This assumption is NOT
+    needed for a bare p-value, and the paper draws the general moral : "CIs require an additional
+    assumption (viz., the hypothetical effect function), as compared to a bare-bones significance
+    test. As such the advocacy for the 'new statistics' ... is far too simplistic" - (p. 375).
+    A trend or a unit-varying effect would need a different reconstruction, which this function
+    does not implement ; it refuses to guess one.
+
+    THE FLOOR. A design whose schedule admits ``m_t`` assignments cannot attain a p below
+    ``1 / (m_t + 1)``. When that floor exceeds alpha, NO interval exists at the requested
+    confidence, and this function raises rather than returning a bracket that means nothing -
+    Michiels et al. (2017, p. 376) on the same arithmetic for AB designs.
+
+    MONTE-CARLO NOISE. Every candidate is tested with the SAME generator seed, so two candidates
+    differ by their data and not by their draws. With independent seeds the accept / reject
+    boundary would jitter by the Monte-Carlo error of p and the reported bounds would not be
+    reproducible.
+
+    The search brackets each side by expanding away from the estimate until rejection, then
+    bisects to ``precision``. The bounds are found INDEPENDENTLY on each side rather than
+    mirrored around the estimate, so an asymmetric acceptance region is reported as it is.
+
+    KNOWN LIMIT : the acceptance set need not be an interval. The reference set is finite, so p is
+    a STEP function of the candidate and, with a two-sided |statistic| comparison, not necessarily
+    monotone - measured on the worked example of the source paper, the exact p is 0.066 at one
+    candidate and 0.026 a little further out. Bisection therefore returns the FIRST crossing on
+    each side, i.e. the convex hull of the acceptance set, which is the conservative reading. A
+    non-convex acceptance region is not reported as such.
+    """
+    labels = np.asarray(labels)
+    values = np.asarray(values, float)
+    treated = np.asarray(treated, bool)
+    alpha = 1.0 - float(confidence)
+    counts = count_admissible_assignments(labels, block_size=block_size,
+                                          max_consecutive=max_consecutive)
+    if np.isfinite(counts["p_floor"]) and counts["p_floor"] > alpha:
+        raise ValueError(
+            f"randomization_interval : the design admits {counts['m_t']} assignment(s), so the "
+            f"smallest attainable p is {counts['p_floor']:.4f}, above alpha = {alpha:.4f}. No "
+            f"{100 * confidence:.0f}% interval exists for this design - the test can never reject, "
+            "whatever the effect. Report a lower confidence level, or a p-value alone.")
+
+    def p_of(delta):
+        """p of the randomization test on the data with `delta` removed from the treated units."""
+        shifted = values - delta * treated
+        return randomization_test(labels, shifted, statistic=statistic, scheme=scheme,
+                                  n_perm=n_perm, random_state=random_state,
+                                  two_sided=True)["p_value"]
+
+    # THE SEARCH RUNS IN DATA UNITS, NOT IN THE STATISTIC'S UNITS. The candidate is a SHIFT applied
+    # to the treated observations, so it lives on the scale of `values`. Centring the search on a
+    # standardized estimate instead would subtract 1.5 where the data need 3.4, leave a residual
+    # effect in every candidate, reject them all, and collapse the interval onto the estimate.
+    delta_hat = float(values[treated].mean() - values[~treated].mean())
+    est = float(statistic(labels, values))
+    p_obs = p_of(0.0)
+    scale = float(np.std(values, ddof=1)) or 1.0
+    tol = float(precision) * scale
+
+    def bound(direction):
+        """Largest (direction=+1) or smallest (direction=-1) retained candidate shift."""
+        lo = delta_hat                                  # retained by construction: shifting by the
+        step = scale                                    # observed difference nulls the treated group
+        hi = None
+        for _ in range(max_expand):                     # expand until one candidate is rejected
+            cand = lo + direction * step
+            if p_of(cand) < alpha:
+                hi = cand
+                break
+            lo, step = cand, step * 2.0
+        if hi is None:
+            return float("inf") * direction             # never rejected within the search range
+        for _ in range(max_iter):                       # bisect between retained lo and rejected hi
+            if abs(hi - lo) <= tol:
+                break
+            mid = 0.5 * (lo + hi)
+            if p_of(mid) < alpha:
+                hi = mid
+            else:
+                lo = mid
+        return lo
+
+    lo_raw, hi_raw = bound(-1), bound(+1)
+    out = {"estimate": delta_hat, "ci_low": lo_raw, "ci_high": hi_raw,
+           "estimate_statistic": est, "units": "data units (the shift applied to the treated)",
+           "confidence": float(confidence), "p_value": float(p_obs), "n_perm": int(n_perm),
+           "m_t": counts["m_t"], "p_floor": counts["p_floor"],
+           "effect_model": "unit-treatment additivity (constant shift on the treated units)",
+           "note": "interval by randomization test inversion (Michiels et al. 2017); the effect "
+                   "model is an assumption the p-value alone does not require"}
+    # A statistic that carries its FROZEN standardizing SD (frozen_sd_statistic) is a constant
+    # multiple of the shift, so its interval is the shift interval rescaled - exactly, not
+    # approximately. Reported alongside rather than instead: the two scales answer different
+    # questions and mixing them up is how a d gets read as a raw difference.
+    sd = getattr(statistic, "frozen_sd", None)
+    if sd:
+        out.update({"ci_low_standardized": lo_raw / sd, "ci_high_standardized": hi_raw / sd,
+                    "frozen_sd": float(sd)})
+    return out
+
+
 _MAX_REJECTION_DRAWS = 200          # rejection-sampling budget per constrained draw
 
 

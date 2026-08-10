@@ -196,6 +196,18 @@ def cluster_effect_size_bounds(res, *, n_obs, alpha=0.05, grid_shape=None,
                "df_used": df_used,
                "d_kind": d_label, "stat_kind": kind,
                "conversion": conversion, "n_obs": int(n_obs),
+               # WHAT THIS PAIR IS NOT. The two bounds bracket the AMBIGUITY OF THE CLUSTER'S SHAPE
+               # (which element of an irregular support to summarise), not the SAMPLING UNCERTAINTY
+               # of the effect. Nothing here is a confidence interval : no coverage statement holds
+               # for it, and it does not shrink as n grows. Stated in the row itself, because a
+               # docstring does not travel into a results table and a "[lower .. upper]" column is
+               # read as an interval by default.
+               "interval_kind": ("NOT a confidence interval - a bracket on the cluster's shape "
+                                 "ambiguity, with no coverage guarantee. A design-based interval "
+                                 "requires inverting the test (Michiels et al. 2017, randomization "
+                                 "test inversion); a spatial statement about where the effect "
+                                 "exceeds a threshold requires confidence sets (Bowring et al. "
+                                 "2019, 2021). Neither is computed here."),
                "bound_note": ("d_max is a positively biased UPPER bound (the element the cluster was "
                               "selected for); d_rect is a LOWER bound. Report both. d_mean_cluster is "
                               "discouraged for planning future studies (irregular support)."),
