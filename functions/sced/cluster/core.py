@@ -428,10 +428,20 @@ def _tfce_run(stat_obs, statmap, Y, Z, pZ, labeler, *, signed, tail, n_perm, alp
               scheme, ds_labels, restat, tfce_e=None, perm=None, relabel=None):
     """Threshold-free counterpart of the fixed-threshold body of cluster_run : enhance the observed
     map, build the max-TFCE permutation null (same FL / Draper-Stoneman schemes), then a per-element
-    FWER p = fraction of permuted max-TFCE >= the element's TFCE. Significant elements are grouped
+    p = fraction of permuted max-TFCE >= the element's TFCE. Significant elements are grouped
     into clusters for REPORTING only (each cluster's p = its min element p). Returns the cluster_run
     keys (+ 'tfce', 'tfce_obs', 'p_elem'). `tfce_e` = extent exponent E (dimensionality-dependent,
-    resolved by the caller via tfce_e_for) ; None falls back to the neutral TFCE_E."""
+    resolved by the caller via tfce_e_for) ; None falls back to the neutral TFCE_E.
+
+    WHAT `p_elem` IS NOT. It has one value per element, which invites reading each element on its
+    own. That reading is not licensed. Like the cluster mass test, TFCE controls the family-wise
+    error rate only WEAKLY, i.e. under the full null ; Frossard & Renaud (2022, NeuroImage 247:
+    118824, p. 2) state it directly - "although the TFCE provides a p-value for each time point, it
+    would be incorrect to interpret these p-values independently", and it is equally incorrect to
+    call the first element with a significant p the onset of the effect. Their simulation adds that
+    the error is not even of a consistent sign : TFCE "can sometimes be conservative and sometimes
+    anti-conservative" (Fig. 3, p. 8). A per-element CLAIM needs a procedure built for it - the
+    cluster depth tests, Troendle (1995), or min-p - not this map re-read element by element."""
     E = TFCE_E if tfce_e is None else float(tfce_e)
     tfce_obs = _tfce_map(stat_obs, labeler, tail, signed, E=E)
     rng = np.random.default_rng(seed)

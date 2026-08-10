@@ -34,6 +34,16 @@ carries no error-rate guarantee (Sassenhagen & Draschkow 2019), and Rousselet (2
 preprint) measures every candidate onset estimator - change point, cluster-depth, cluster-sum, FDR
 BH95/BY01, MAX - as biased late by 21 to 45 ms, with cluster-depth among the worst despite its
 strong FWER control. Read a cluster as "a difference exists somewhere in this window", nothing more.
+
+That last clause deserves a correction, because it judges a method on a criterion it was not built
+for. Frossard & Renaud (2022, NeuroImage 247:118824) designed the cluster depth tests for PER-POINT
+error control, not for onset ESTIMATION, and prove asymptotic STRONG FWER control (their Theorem 1,
+p. 6) where cluster mass and TFCE give only weak control. What such a result licenses is a bounded
+claim, not a point estimate : significant points from 50 to 70 mean "there is at least one region
+of true effect from 50 to 70, beginning no later than 50 and ending no earlier than 70" (p. 6).
+Rousselet's verdict and theirs are answers to two different questions, and the same method can
+reasonably be poor at the first and sound at the second. This layer implements neither : it has no
+per-point procedure at all, which is precisely the gap those tests fill.
 """
 
 from .core import (triu_edges, edge_components, adjacency_components, freq_product_adjacency,
