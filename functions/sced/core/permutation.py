@@ -1043,6 +1043,26 @@ def randomization_interval(labels, values, *, statistic, scheme, treated, confid
     bisects to ``precision``. The bounds are found INDEPENDENTLY on each side rather than
     mirrored around the estimate, so an asymmetric acceptance region is reported as it is.
 
+    THE STATISTIC MUST BE EFFECT INCREASING, and this is a condition on the CALLER's choice, not on
+    this function. An inversion interval covers at the stated rate only for a statistic that cannot
+    DECREASE when a positive constant is added to the treated units (Luo et al. 2021; Caughey et al.
+    2021, via Fiksel 2024, Biometrics 80(2):ujae051, p. 3). The difference in means and the Wilcoxon
+    rank sum qualify. STUDENTIZED statistics do not - "studentized test statistics are not
+    effect-increasing, and thus we cannot guarantee exact coverage" (Fiksel 2024, p. 6) - so passing
+    a t, or any ratio whose denominator is recomputed from the shifted data, voids the guarantee.
+    ``frozen_sd_statistic`` is safe because a frozen denominator is a positive CONSTANT multiple of
+    the difference in means, which preserves the property ; the same freeze is required for a second,
+    independent reason in Michiels et al. (2017, p. 368). An adjusted (ANCOVA) coefficient is not
+    guaranteed effect increasing either, and Fiksel's Theorem 1 (p. 3) gives a condition checkable
+    on the observed data. No check is performed here : the statistic is a black box to this function.
+
+    FASTER ROUTE, not implemented. Where the statistic admits it, the inversion has a CLOSED FORM
+    (Zhu & Liu 2022 ; Fiksel 2024, p. 3) : the p-value only changes where a permuted statistic
+    crosses the observed one, so one solves for those crossing points, sorts them, and reads the
+    bounds as order statistics - one pass, measured at 8 per cent of the p-value's own cost, against
+    roughly 30x for the bisection used below (Fiksel 2024, p. 5, Table 1). This search is kept
+    because it accepts an arbitrary statistic and an arbitrary schedule ; it is the slow route.
+
     KNOWN LIMIT : the acceptance set need not be an interval. The reference set is finite, so p is
     a STEP function of the candidate and, with a two-sided |statistic| comparison, not necessarily
     monotone - measured on the worked example of the source paper, the exact p is 0.066 at one
