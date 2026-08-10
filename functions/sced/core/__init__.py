@@ -136,6 +136,7 @@ from .permutation import (
     stratified_condition_permutation_test,
     choose_permutation_method_group,
     huh_jhun_test,
+    freedman_lane_test,
     recommend_scheme,
     heterogeneity_test,
     pairwise_contrasts,
@@ -147,6 +148,7 @@ from .permutation import (
     randomization_test,
     alternating_scheme,
     block_scheme,
+    count_admissible_assignments,
     sced_test_name,
     sced_methods_text,
 )
@@ -203,6 +205,7 @@ __all__ = [
     "stratified_condition_permutation_test",
     "choose_permutation_method_group",
     "huh_jhun_test",
+    "freedman_lane_test",
     "recommend_scheme",
     "heterogeneity_test",
     "pairwise_contrasts",
@@ -214,6 +217,7 @@ __all__ = [
     "randomization_test",
     "alternating_scheme",
     "block_scheme",
+    "count_admissible_assignments",
     "sced_test_name",
     "sced_methods_text",
 ]

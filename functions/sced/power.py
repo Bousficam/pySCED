@@ -22,6 +22,23 @@ effect back in). It is a monotone function of the p-value and is uninformative
 (Hoenig & Heisey 2001, The American Statistician 55(1), 19-24); ``retrospective_power``
 asks instead "what power did this design have for an effect I care about?", which is
 legitimate.
+
+ESTIMAND - every simulation-based read-out here is **unconditional** (random-sampling)
+power: a new Gaussian dataset per replication. The **conditional** power of Michiels,
+Heyvaert & Onghena (2017) - fix the observed series, add the assumed effect to the target
+condition, re-randomise only the schedule - is the estimand aligned with the randomization
+test's own assignment model, and is the one that makes no distributional assumption. Do not
+read the numbers below as conditional power.
+
+TODO(SCED, power) - WORK IN PROGRESS, BRANCH UNDER CONSTRUCTION: add
+``conditional_power_sced_alternating`` implementing the Michiels et al. (2017) estimand on
+top of the existing engines (no new sampling model needed: the schedule generators and
+``randomization_test`` already provide everything). Two cautions to settle before it ships:
+(1) conditional power varies several-fold across realised datasets, so it must never sit in
+the same report cell as the unconditional value without an explicit label; (2) the
+schedule constraints must be the ones the study actually used, per
+``count_admissible_assignments``. Until then this module reports the unconditional estimand
+only, and says so.
 """
 import numpy as np
 import pandas as pd
@@ -91,7 +108,16 @@ def power_sced_alternating(*, effect, sd, n_sessions, conditions=("A", "B"),
     cohens_d, n_sims, n_perm, ...}``. Increase ``n_sims``/``n_perm`` to tighten the
     Monte-Carlo error (reported as ``mc_se``).
 
-    References: Michiels, Heyvaert and Onghena (2017); Bouwmeester and Jongerling (2020) (simulation-based power for single-case randomization tests).
+    ESTIMAND - this is **unconditional** (random-sampling) power: each simulation draws a NEW
+    dataset from a Gaussian model, so the result is the power averaged over datasets the model
+    could produce. It is NOT the **conditional** power of Michiels, Heyvaert & Onghena (2017),
+    which fixes the observed series, adds the assumed effect to the target condition and
+    re-randomises only the schedule - the framework aligned with the randomization test's own
+    assignment model, and the one that makes no distributional assumption. The two differ
+    materially: conditional power varies several-fold across realised datasets whose average is
+    the unconditional value. Conditional power is NOT provided here (see the module TODO).
+
+    References: Bouwmeester and Jongerling (2020) (simulation-based power for single-case randomization tests); Michiels, Heyvaert and Onghena (2017) - cited for the SCED power context, NOT as the estimand implemented here.
     R equivalent: no direct R equivalent (Monte-Carlo power reuses the study's own permutation test); SCRT power tools - potential equivalent, to test.
     """
     conditions = tuple(conditions)
@@ -123,7 +149,10 @@ def mdes_sced_alternating(*, sd, n_sessions, conditions=("A", "B"), n_units=1,
     d and raw units, plus the full power curve. This is the rigorous way to read a
     design "after the fact": what could it have caught? (cf. Hoenig & Heisey 2001).
 
-    References: Michiels, Heyvaert and Onghena (2017) (conditional power of randomization tests); Hoenig and Heisey (2001) (sensitivity vs observed-power fallacy).
+    Inherits the estimand of ``power_sced_alternating``: UNCONDITIONAL (random-sampling) power,
+    not the conditional power of Michiels et al. (2017).
+
+    References: Hoenig and Heisey (2001) (sensitivity vs observed-power fallacy); Michiels, Heyvaert and Onghena (2017) (SCED power context).
     R equivalent: no direct R equivalent (simulation-based MDES on the study's own permutation test).
     """
     curve = []

@@ -43,6 +43,7 @@ from functions.sced.core import (
     randomization_test,
     alternating_scheme,
     block_scheme,
+    count_admissible_assignments,
     diff_in_means,
     omnibus_variance,
     make_ordered_trend_stat,
@@ -83,6 +84,48 @@ def _carryover_diagnostic(df, session_col, condition_col, outcome_col):
             "Carryover/order warning": (
                 "Marked session trend: risk of carryover / temporal confound."
                 if flag else "No marked order trend.")}
+
+
+def _design_floor_rows(labels, block_size, max_consecutive, units=None):
+    """Report rows describing the DESIGN's reference set, independently of the Monte-Carlo one.
+
+    In: the observed condition labels (plus ``units`` for a stratified group design, where each
+    unit was randomised independently so the joint set is the product of the per-unit sets),
+    and the schedule constraints. Out: a dict of Setup-sheet rows. No side effect.
+
+    Reports m_t and the attainable floor 1/(m_t+1). A design whose floor sits above alpha
+    cannot return a significant randomization test whatever the effect (Heyvaert & Onghena
+    2014; Levin et al. 2016), which the Monte-Carlo resolution 1/(1+B) hides entirely. The
+    p-value itself is unchanged: the engines keep the (1+k)/(1+B) convention (Phipson & Smyth
+    2010) and this is an information row, not a second test."""
+    import numpy as _np
+    if units is None:
+        adm = count_admissible_assignments(labels, block_size=block_size,
+                                           max_consecutive=max_consecutive)
+        m_t, exact, basis = adm["m_t"], adm["exact"], adm["basis"]
+    else:
+        units = _np.asarray(units)
+        m_t, exact = 1, True
+        for u in pd.unique(units):
+            a = count_admissible_assignments(labels[units == u], block_size=block_size,
+                                             max_consecutive=max_consecutive)
+            m_t *= a["m_t"]
+            exact = exact and a["exact"]
+        basis = "product of the per-unit schedules (independent randomisation per unit)"
+    floor = (1.0 / (m_t + 1)) if m_t else float("nan")
+    verdict = ("floor above 0.05: this design CANNOT reach significance whatever the effect"
+               if floor > 0.05 else
+               "floor below 0.05: the design can reach significance"
+               + ("" if m_t >= 20 else "; fewer than 20 admissible assignments, power is "
+                                       "structurally limited (Heyvaert & Onghena 2014)"))
+    return {
+        "Admissible assignments (m_t)": (f"{m_t:,}" if exact else f"<= {m_t:,} (upper bound)"),
+        "Reference set basis": basis,
+        # 3 significant digits, not round(.., 6): a large m_t makes the floor smaller than
+        # 1e-6 and rounding would print it as a bare 0.0.
+        "Attainable p-floor 1/(m_t+1)": (f"{floor:.3g}" if _np.isfinite(floor) else "n/a"),
+        "P-floor verdict": verdict,
+    }
 
 
 def _effect_sizes_table(df, condition_col, outcome_col, conditions, improvement):
@@ -328,15 +371,22 @@ def pipeline_sced_alternating(df, *, session_col, condition_col, outcome_col,
     # NOT applied to the randomized condition factor.
     time_trend = None
     if test_time_trend and np.unique(sessions[np.isfinite(sessions)]).size >= 4:
-        from ..core import huh_jhun_test, recommend_scheme
+        from ..core import huh_jhun_test, freedman_lane_test, recommend_scheme
         cond_codes = pd.Categorical(labels, categories=list(conditions)).codes.astype(float)
         nuis = [cond_codes] + ([cov[:, j] for j in range(cov.shape[1])] if cov is not None else [])
         nkind = ["discrete"] + (["continuous"] * (cov.shape[1] if cov is not None else 0))
         rec = recommend_scheme(role="fixed", kind="continuous", n=int(np.asarray(sessions).size))
+        # PRIMARY = recommended scheme (Freedman-Lane : robust, whitening-free). Huh-Jhun is still
+        # computed and reported as a sensitivity comparator (its small-n whitened p is fragile to the
+        # outcome metric), never as the headline.
+        prim_fn = huh_jhun_test if rec["primary"] == "huh-jhun" else freedman_lane_test
+        pr = prim_fn(values, effect=sessions, nuisance=nuis, nuisance_kind=nkind,
+                     stat="W", n_perm=n_perm, seed=random_state)
         hj = huh_jhun_test(values, effect=sessions, nuisance=nuis, nuisance_kind=nkind,
                            stat="W", n_perm=n_perm, seed=random_state)
-        time_trend = {"slope": round(float(hj["slope"]), 5), "p": round(float(hj["p"]), 4),
-                      "stat": round(float(hj["stat"]), 4), "scheme": hj["scheme"],
+        time_trend = {"slope": round(float(pr["slope"]), 5), "p": round(float(pr["p"]), 4),
+                      "stat": round(float(pr["stat"]), 4), "scheme": pr["scheme"],
+                      "p_hj_sensitivity": round(float(hj["p"]), 4),
                       "recommended": rec["primary"]}
 
     carry = _carryover_diagnostic(sub, session_col, condition_col, outcome_col)
@@ -359,6 +409,7 @@ def pipeline_sced_alternating(df, *, session_col, condition_col, outcome_col,
         "Randomization p-value": round(rand["p_value"], 4),
         "Observed statistic": round(rand["observed"], 4),
     }
+    model_info.update(_design_floor_rows(labels, block_size, max_consecutive))
     model_info.update(report)
     model_info.update(diag)
     if method_rec is not None:
@@ -448,15 +499,19 @@ def pipeline_sced_alternating(df, *, session_col, condition_col, outcome_col,
         from functions.sced.glossary import interpretation_glossary, ascii_sanitize_df as S, data_recap_df
         recap = data_recap_df(df, tier_col=None, session_col=session_col, phase_col=condition_col,
                               outcomes=[outcome_col], design="ATD / N-of-1 (randomised alternation)")
-        # Model-based ADJUSTED EFFECTS (complement the omnibus + nonoverlap ES) : the time slope via
-        # Freedman-Lane (fixed covariate) and the condition contrasts via Draper-Stoneman (randomized
-        # dose). Notably fills the missing TIME-slope estimate. Best-effort (keeps the report robust).
+        # Model-based ADJUSTED EFFECTS = the full ANCOVA outcome ~ time + phase + covariate(s), one
+        # row per term (complements the omnibus + nonoverlap ES) : the time slope + each nuisance
+        # covariate slope (e.g. fatigue) via Freedman-Lane (fixed covariate) and the condition
+        # contrasts via Draper-Stoneman (randomized dose), each two-sided. Notably fills the missing
+        # TIME-slope + covariate estimates. Best-effort (keeps the report robust).
         adj_df = None
         try:
             from functions.sced.cluster.report import scalar_adjusted_effects
             adj_df = scalar_adjusted_effects(values, sessions, labels, list(conditions),
                                              perm_phase="draper-stoneman", block_size=block_size,
-                                             max_consecutive=max_consecutive, n_perm=n_perm)
+                                             max_consecutive=max_consecutive, n_perm=n_perm,
+                                             covariates=cov,
+                                             cov_names=list(covariate_cols) if covariate_cols else None)
         except Exception as e:                              # keep the report robust, but never SILENT
             adj_df = None
             if verbose:
@@ -467,7 +522,7 @@ def pipeline_sced_alternating(df, *, session_col, condition_col, outcome_col,
             S(diag_df).to_excel(writer, sheet_name="Diagnostics", index=False)
             S(rand_df).to_excel(writer, sheet_name="Randomization Test", index=False)
             if adj_df is not None:
-                S(adj_df).to_excel(writer, sheet_name="Adjusted effects", index=False)
+                S(adj_df).to_excel(writer, sheet_name="ANCOVA effects", index=False)
             if trend_df is not None:
                 S(trend_df).to_excel(writer, sheet_name="Ordered Trend", index=False)
             S(es_df).to_excel(writer, sheet_name="Effect Sizes", index=False)

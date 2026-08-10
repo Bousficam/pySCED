@@ -63,7 +63,7 @@ from functions.sced.core import (
     PEM_BANDS,
     _group_nuisance,
 )
-from functions.sced.alternating.core import _effect_sizes_table
+from functions.sced.alternating.core import _effect_sizes_table, _design_floor_rows
 from functions.sced.power import power_report
 
 
@@ -295,10 +295,17 @@ def _annotate_effect_sizes(df):
     df = df.copy()
     df["Explanation"] = ("Pairwise nonoverlap (averaged across patients). Strength-column "
                          f"bands - NAP: {NAP_BANDS}; Tau-U: {TAU_BANDS}; "
-                         f"PND: {PND_BANDS}; PEM: {PEM_BANDS}.")
-    df["Interpretation"] = df.apply(
-        lambda r: f"{_nap_mag(r['NAP'])} effect (NAP={r['NAP']}, Tau-U={r['Tau-U']}).",
-        axis=1)
+                         f"PND: {PND_BANDS}; PEM: {PEM_BANDS}. 'Tau-U variants' lists the "
+                         "variant each patient's data selected: when they differ, the mean "
+                         "Tau-U is left blank because the variants are different statistics "
+                         "(Fingerhut et al. 2021) - aggregate with HLM or a between-case SMD.")
+
+    def _verdict(r):
+        tau = r["Tau-U"]
+        tau_txt = (f"Tau-U={tau}" if np.isfinite(tau) else
+                   f"Tau-U not aggregable (mixed variants: {r.get('Tau-U variants', 'n/a')})")
+        return f"{_nap_mag(r['NAP'])} effect (NAP={r['NAP']}, {tau_txt})."
+    df["Interpretation"] = df.apply(_verdict, axis=1)
     return df
 
 
@@ -474,6 +481,32 @@ def _per_unit_table(clean, *, unit_col, session_col, condition_col, outcome_col,
     return pd.DataFrame(rows)
 
 
+def _tau_variant_consistency(es_concat):
+    """Which Tau-U variant(s) the per-patient tables actually used, per comparison.
+
+    In: the concatenation of the per-patient effect-size tables (one row per patient x pair).
+    Out: a DataFrame ``[Comparison, Tau-U variants]`` where the string lists the distinct
+    variant families found, joined by ' | ' when they differ. No side effect.
+
+    The families are collapsed to their statistic ('adj' = Tarlow tau-b on detrended residuals,
+    'trend A' = Brossard bounded tau-a, 'A vs B' = uncorrected tau-a) because only the
+    statistic matters for whether a mean is defined; the n_A < 7 warning suffix does not."""
+    def _family(v):
+        s = str(v)
+        if "adj" in s:
+            return "adj (Tarlow tau-b)"
+        if "trend A" in s:
+            return "trend A (Brossard tau-a)"
+        return "A vs B (uncorrected tau-a)"
+
+    if "Tau-U variant" not in es_concat.columns:
+        return pd.DataFrame({"Comparison": [], "Tau-U variants": []})
+    fam = es_concat.assign(_f=es_concat["Tau-U variant"].map(_family))
+    out = (fam.groupby("Comparison")["_f"]
+           .apply(lambda s: " | ".join(sorted(set(s)))).reset_index())
+    return out.rename(columns={"_f": "Tau-U variants"})
+
+
 def _group_by_condition(sub, *, unit_col, condition_col, outcome_col, conditions):
     """GROUP-level description per condition: pooled mean and SD (all obs) AND the
     between-patient SD (standard deviation of per-patient means) - to distinguish within-
@@ -640,6 +673,16 @@ def pipeline_sced_alternating_group(df, *, unit_col, session_col, condition_col,
     # cross-patient mean is meaningless -> not kept in the group aggregate.
     es_df = es_df.drop(columns=["Tau-U critical (a.05)", "Tau-U p"], errors="ignore")
     es_df.insert(0, "Aggregation", "mean across units")
+    # A cross-patient mean of Tau-U is only defined when every patient used the SAME variant:
+    # `auto` selects per patient, and `adj` (Tarlow) is a tau-b on Theil-Sen-detrended residuals
+    # while the others are the tau-a nonoverlap contrast - averaging them mixes two statistics
+    # under one header. Fingerhut, Xu & Moeyaert (2021, p. 8-9) forbid an overall Tau-U when
+    # patients require different variants; use HLM or a between-case SMD to aggregate instead.
+    # The string variant column is dropped by mean(numeric_only=True), so the mixing was
+    # previously invisible: surface it and blank the mean rather than publish a mixed number.
+    es_df = es_df.merge(_tau_variant_consistency(es_concat), on="Comparison", how="left")
+    _mixed = es_df["Tau-U variants"].str.contains(" | ", regex=False, na=False)
+    es_df.loc[_mixed, "Tau-U"] = np.nan
     # re-attach the interpretation bands (lost by numeric aggregation) on the aggregated
     # values, so they are reported as in n-of-1
     es_df["Strength NAP"] = es_df["NAP"].map(nap_magnitude)
@@ -718,6 +761,7 @@ def pipeline_sced_alternating_group(df, *, unit_col, session_col, condition_col,
         "Randomization p-value": round(rand["p_value"], 4),
         "Observed statistic": round(rand["observed"], 4),
     }
+    model_info.update(_design_floor_rows(labels, block_size, max_consecutive, units=units))
     if method_rec is not None:
         model_info["Method recommendation"] = method_rec["recommended_method"]
         model_info["Condition-time R2 (mean within-unit)"] = method_rec["condition_time_R2"]
@@ -725,10 +769,12 @@ def pipeline_sced_alternating_group(df, *, unit_col, session_col, condition_col,
     # heterogeneity: does the effect vary across units? (interaction FL + Cochran Q/I2)
     het_df = None
     if test_heterogeneity:
+        # no max_consecutive here: the interaction null is necessarily residual-based
+        # (Freedman-Lane), so a schedule constraint cannot apply - see heterogeneity_test.
         het = heterogeneity_test(values, labels, units, sessions, conditions=conditions,
                                  condition_order=condition_order, dose=dose,
                                  detrend=detrend_used, n_perm=n_perm,
-                                 max_consecutive=max_consecutive, standardize=standardize,
+                                 standardize=standardize,
                                  random_state=random_state)
         ip = het["interaction_p"]
         ds = het["dose_slope"]
@@ -913,6 +959,21 @@ def pipeline_sced_alternating_group(df, *, unit_col, session_col, condition_col,
                                              data_recap_df, style_cells, _to_float)
         recap = data_recap_df(df, tier_col=unit_col, session_col=session_col, phase_col=condition_col,
                               outcomes=[outcome_col], design="Group ATD (randomised alternation)")
+        # Group ANCOVA effect ESTIMATES = outcome ~ unit + time + phase + covariate(s), pooled OLS with
+        # UNIT fixed effects, one row per term with a within-unit (stratified) two-sided permutation p.
+        # Fills the missing time-slope + covariate (e.g. fatigue) estimates of the group report.
+        # Best-effort (keeps the report robust).
+        adj_df = None
+        try:
+            from functions.sced.cluster.report import group_adjusted_effects
+            adj_df = group_adjusted_effects(values, sessions, labels, units, list(conditions),
+                                            covariates=cov,
+                                            cov_names=list(covariate_cols) if covariate_cols else None,
+                                            n_perm=min(n_perm, 2000), seed=random_state)
+        except Exception as e:                              # keep the report robust, but never SILENT
+            adj_df = None
+            if verbose:
+                print(f"ANCOVA effects sheet skipped: {type(e).__name__}: {e}")
 
         # --- colour rules to HIGHLIGHT THE RESULTS (green = notable, amber = intermediate,
         # grey = not significant) - detected by column name, applied uniformly to all data
@@ -984,6 +1045,8 @@ def pipeline_sced_alternating_group(df, *, unit_col, session_col, condition_col,
             W(_annotate_per_unit(per_unit_df, conditions), "Per Unit")
             W(_annotate_effect_sizes(es_df), "Effect Sizes")
             W(_annotate_randomization(rand_df, rand["p_value"]), "Randomization Test")
+            if adj_df is not None:                          # ANCOVA effect estimates (time/covariate/phase)
+                W(adj_df, "ANCOVA effects", key_col="Effect")
             if het_df is not None:
                 W(_annotate_heterogeneity(het_df), "Heterogeneity", key_col="Element")
             if posthoc_df is not None:

@@ -18,6 +18,8 @@ Maris & Oostenveld (2007) J. Neurosci. Methods - cluster-based permutation.
 Freedman & Lane (1983) ; Winkler et al. (2014) - permutation with nuisance.
 """
 
+import os
+
 import numpy as np
 
 
@@ -73,12 +75,57 @@ def edge_components(supra_mask, iu, ju, n_nodes):
     return lbl, sizes
 
 
+def check_adjacency(adjacency, *, names=None):
+    """Pre-flight check of the element NEIGHBOURHOOD, which is what the clustering step operates on.
+
+    In : the adjacency (dense or sparse). Out : a dict of findings; never raises, never mutates. An
+    asymmetric or inhomogeneous neighbour definition silently distorts which clusters can form at all,
+    so Meyer et al. (2021, p. 5-6) prescribe verifying symmetry and per-element homogeneity - and
+    plotting the neighbourhood - BEFORE running the test. ``degree`` here excludes self-adjacency.
+    ``isolated`` elements can never join a cluster; a large ``degree_ratio`` means some elements can
+    recruit far more neighbours than others, which biases where clusters form.
+    """
+    A = adjacency
+    try:
+        M = np.asarray(A.todense(), dtype=float) if hasattr(A, "todense") else np.asarray(A, float)
+    except Exception:
+        M = np.asarray(A, dtype=float)
+    n = M.shape[0]
+    deg = (M != 0).sum(axis=1) - (np.diag(M) != 0).astype(int)
+    asym = int(np.sum((M != 0) != (M != 0).T) // 2)
+    dmin, dmax = (int(deg.min()), int(deg.max())) if n else (0, 0)
+    iso = np.where(deg == 0)[0]
+    return {"n_elements": int(n), "symmetric": asym == 0, "n_asymmetric_pairs": asym,
+            "degree_min": dmin, "degree_max": dmax,
+            "degree_mean": round(float(deg.mean()), 2) if n else 0.0,
+            "degree_ratio": (round(dmax / dmin, 2) if dmin else float("inf")),
+            "n_isolated": int(iso.size),
+            "isolated": ([str(names[i]) for i in iso] if names is not None else iso.tolist())[:20],
+            "verdict": ("OK" if (asym == 0 and iso.size == 0 and dmin and dmax / dmin <= 3)
+                        else "INSPECT: " + "; ".join(filter(None, [
+                            f"{asym} asymmetric pair(s)" if asym else "",
+                            f"{iso.size} isolated element(s) (can never cluster)" if iso.size else "",
+                            (f"degree range {dmin}-{dmax} is inhomogeneous" if dmin and dmax / dmin > 3
+                             else "")]))),
+            "reference": "Meyer et al. 2021 (Dev. Cogn. Neurosci. 52:101036) p. 5-6: define "
+                         "neighbourhoods bidirectionally and plot them to verify symmetry and "
+                         "homogeneity for the electrode layout in use."}
+
+
 def adjacency_components(supra_mask, adjacency):
     """Connected components of the supra-threshold ELEMENTS on a generic adjacency.
 
     adjacency : sparse (n_elements, n_elements) neighbour matrix (e.g. the electrode x
     frequency adjacency from mne.stats.combine_adjacency). Returns label_per_element
     (0 = element not retained). Sensor-space counterpart of edge_components.
+
+    MEASURED, do not "optimise" blindly. A TFCE run calls this 50 times per permutation, so it
+    dominates that path (84 per cent of the run at 272 elements). The obvious suspect, the double
+    fancy-index below, is NOT the cost : replacing it with a pre-extracted edge list masked per
+    call was measured 8 per cent SLOWER end to end, because rebuilding a COO per call costs more
+    than the CSR slice saves. The remaining cost is connected_components itself, once per height,
+    and the only real gain left is algorithmic - a union-find over elements sorted by height would
+    compute all heights in ONE pass, the TFCE masks being nested by construction.
     """
     from scipy.sparse.csgraph import connected_components
     lbl = np.zeros(len(supra_mask), dtype=int)
@@ -92,8 +139,129 @@ def adjacency_components(supra_mask, adjacency):
 
 
 # ---------------------------------------------------------------------------
-# Cluster scoring, thresholding, trend helper
+# Exchangeability blocks (Winkler et al. 2014, 2015)
 # ---------------------------------------------------------------------------
+# A permutation test is valid only for rearrangements the data's dependence structure admits. A
+# FREE permutation of the n rows asserts one error term and one variance : it is the right group
+# when the rows are the repeated measures of a single unit, and the WRONG one as soon as Y stacks
+# several units, where it destroys the within-unit dependence the observed statistic still carries
+# and narrows the null (anti-conservative). Winkler et al. (2014, p. 384-386) replace the free
+# group by EXCHANGEABILITY BLOCKS, rearranged either internally (within-block) or as a whole
+# (whole-block) ; Winkler et al. (2015) nest the two. Measured here on a run x session design with
+# a session random effect, a session-level term tested by free permutation reaches a type I error
+# of 0.275 at alpha = 0.05, against 0.040 for the whole-block regime.
+def block_index(blocks):
+    """Row indices of each block, in order of first appearance.
+
+    In : a label per row. Out : {label: index array}. No side effect.
+    """
+    b = np.asarray(blocks)
+    return {lab: np.where(b == lab)[0] for lab in dict.fromkeys(b.tolist())}
+
+
+def block_permuter(blocks=None, *, exchange="within", units=None):
+    """Build the row-permutation generator for one exchangeability regime.
+
+    In : the block label per row (None = free permutation, the historical default), the regime
+         ('within' | 'whole' | 'nested'), and, for the block-moving regimes, the label of the
+         SUPER-block each row belongs to (blocks are exchanged only inside their super-block ;
+         None means every block is exchangeable with every other).
+    Out : a callable ``perm(rng, n) -> index vector`` where ``out[i]`` is the SOURCE row of
+          position i. Side effect : consumes randomness from the generator it is handed.
+
+      'within' - rows move inside their block, the blocks stay put. The regime for a term that
+                 VARIES inside the block. A term constant within block is untestable here : the
+                 permuted statistic equals the observed one and p tends to 1.
+      'whole'  - whole blocks are exchanged inside their super-block, contents intact. The regime
+                 for a term constant within block. Requires equal block sizes.
+      'nested' - both at once (blocks exchanged, then rows shuffled inside), i.e. two levels of
+                 exchangeability (Winkler et al. 2015).
+
+    ``blocks=None`` reproduces the previous free shuffle EXACTLY, including its consumption of the
+    generator, so a call that does not ask for blocks is unchanged down to the last draw.
+    """
+    if blocks is None:                                  # free permutation : the historical path,
+        order = np.empty(0, dtype=int)                  # same in-place shuffle of a kept array
+
+        def perm_free(rng, n):
+            nonlocal order
+            if order.size != n:
+                order = np.arange(n)
+            rng.shuffle(order)
+            return order
+        return perm_free
+    idx = block_index(blocks)
+    if exchange == "within":
+        def perm_within(rng, n):
+            out = np.arange(n)
+            for rows in idx.values():
+                out[rows] = rng.permutation(rows)
+            return out
+        return perm_within
+    if exchange not in ("whole", "nested"):
+        raise ValueError(f"exchange must be 'within', 'whole' or 'nested', not {exchange!r}")
+    # whole / nested : group the blocks by super-block, then check they are interchangeable at all.
+    if units is None:
+        by_super = {None: list(idx)}
+    else:
+        u = np.asarray(units)
+        by_super = {}
+        for lab, rows in idx.items():
+            vals = set(u[rows].tolist())
+            if len(vals) != 1:
+                raise ValueError(f"block_permuter : block {lab!r} spans several units ({vals}). "
+                                 "Exchangeability blocks must nest inside their unit.")
+            by_super.setdefault(vals.pop(), []).append(lab)
+    for sup, members in by_super.items():
+        sizes = {len(idx[b]) for b in members}
+        if len(sizes) > 1:
+            raise ValueError(
+                f"block_permuter : inside unit {sup!r} the blocks do not all have the same size "
+                f"({sorted(sizes)}), so exchanging whole blocks is not admissible - it would "
+                "change the sample size attached to the tested term rather than relabel the same "
+                "data. Restrict to complete blocks, or aggregate and use the 'within' regime.")
+    shuffle_within = exchange == "nested"
+
+    def perm_whole(rng, n):
+        out = np.arange(n)
+        for members in by_super.values():
+            order = rng.permutation(len(members))
+            for pos, b in enumerate(members):
+                src = idx[members[order[pos]]]
+                out[idx[b]] = rng.permutation(src) if shuffle_within else src
+        return out
+    return perm_whole
+
+
+def scheme_by_block(scheme, labels, blocks=None, *, exchange="within", units=None):
+    """Wrap a randomization schedule so it draws inside the exchangeability blocks.
+
+    In : a ``scheme(labels, rng) -> relabeled`` generator (alternating_scheme / block_scheme), the
+         observed label vector, the blocks, the regime and the super-block labels.
+    Out : a callable ``draw(rng) -> relabeled vector``. Side effect : consumes randomness.
+
+    Design-based (Draper-Stoneman) randomization has the same exchangeability problem as the
+    residual permutation : redrawing the assignment ACROSS units invents schedules the trial never
+    could have produced. Under 'within' the schedule is redrawn separately inside each block, so
+    each block keeps its own condition counts ; under 'whole' / 'nested' the block's label sequence
+    travels with the block. ``blocks=None`` calls the scheme on the whole vector, as before.
+    """
+    labels = np.asarray(labels)
+    if blocks is None:
+        return lambda rng: scheme(labels, rng)
+    if exchange == "within":
+        idx = block_index(blocks)
+
+        def draw_within(rng):
+            out = np.array(labels, copy=True)
+            for rows in idx.values():
+                out[rows] = scheme(labels[rows], rng)
+            return out
+        return draw_within
+    perm = block_permuter(blocks, exchange=exchange, units=units)
+    return lambda rng: labels[perm(rng, labels.shape[0])]
+
+
 def _component_scores(comp_labels, stat, cluster_stat):
     """Score per component : element count (extent) or mass = sum |stat| (intensity).
 
@@ -130,6 +298,173 @@ def _supra(stat, tail, thr, signed):
     return stat <= -thr
 
 
+def _merge_directions(rp, rn):
+    """Combine the positive-direction and negative-direction cluster results of a two-tailed signed
+    run into ONE res dict (same keys as a single pass), with sign-separated clusters. Labels of the
+    negative pass are offset so pos/neg never collide ; their component supports are disjoint (a cell
+    is either pos-supra or neg-supra, never both), so comp_labels sum cleanly. Each direction keeps
+    its OWN same-sign max-cluster null (Zalesky NBS convention), so a strong cluster of one sign does
+    not raise the bar for the other. null_max is concatenated for diagnostics only."""
+    off = int(rp["comp_labels"].max())
+    neg_lab = np.where(rn["comp_labels"] > 0, rn["comp_labels"] + off, 0)
+    comp_pvals = dict(rp["comp_pvals"]); comp_pvals.update({k + off: v for k, v in rn["comp_pvals"].items()})
+    comp_scores = dict(rp["comp_scores"]); comp_scores.update({k + off: v for k, v in rn["comp_scores"].items()})
+    # TWO-TAILED CONVENTION, stated explicitly rather than left implicit. Each direction is judged
+    # against its OWN same-sign max-cluster null at the same alpha, i.e. two one-sided tests, so the
+    # per-direction p is NOT already two-tailed. Meyer et al. (2021, p. 5) require the convention to
+    # be declared and corrected one of two equivalent ways: halve alpha, or double the Monte-Carlo p.
+    # Neither is applied here (that would change every p this project has already reported); the
+    # convention is REPORTED so the reader can apply it, and so a bare p is never ambiguous by 2x.
+    merged = {"tail_convention": "two one-sided passes, each vs its own same-sign null at alpha; "
+                                 "p is NOT doubled - halve alpha or double p for a two-tailed claim "
+                                 "(Meyer et al. 2021 p. 5; Zalesky NBS sign-separated convention)",
+              "signed": rp.get("signed", True),   # a two-tailed pass only exists for a signed stat
+              "stat": rp["stat"], "thresh": rp["thresh"], "comp_labels": rp["comp_labels"] + neg_lab,
+              "comp_pvals": comp_pvals, "sig_edges": rp["sig_edges"] | rn["sig_edges"],
+              "sizes_obs": np.concatenate([rp["sizes_obs"], rn["sizes_obs"]]),
+              "comp_scores": comp_scores, "cluster_stat": rp["cluster_stat"],
+              "null_max": np.concatenate([rp["null_max"], rn["null_max"]])}
+    if rp.get("tfce"):                                 # carry the threshold-free per-element maps
+        merged["tfce"] = True                          # pos/neg supports are disjoint -> sum the maps,
+        merged["tfce_obs"] = rp["tfce_obs"] + rn["tfce_obs"]   # take the per-element min p across dirs
+        merged["p_elem"] = np.minimum(rp["p_elem"], rn["p_elem"])
+    return merged
+
+
+# ---------------------------------------------------------------------------
+# TFCE - Threshold-Free Cluster Enhancement (Smith & Nichols 2009, NeuroImage 44:83-98)
+# ---------------------------------------------------------------------------
+# Instead of one arbitrary cluster-forming threshold, TFCE integrates each element's cluster support
+# over ALL heights h : TFCE(i) = integral_0^{h_i} extent(h, i)^E * h^H dh, where extent(h, i) is the
+# size of the supra-threshold cluster containing i at height h (the SAME adjacency labeler as the
+# fixed-threshold path). The TFCE map is the statistic ; inference is the max-TFCE permutation null,
+# giving a per-ELEMENT FWER-corrected p (not a per-cluster p). Signed t : done per direction (the
+# pos/neg split in cluster_run), so a positive and a negative cluster never merge.
+#
+# The HEIGHT exponent H = 2 in every dimension (Smith & Nichols 2009 ; Mensen & Khatami 2013 keep
+# H = 2 for EEG). The EXTENT exponent E depends on the DIMENSIONALITY of the element lattice, because
+# "extent" (a count of connected neighbours) scales with the lattice dimension and E rebalances it
+# against the height term (Smith & Nichols 2009, sec. on weighting parameters ; Mensen & Khatami 2013
+# p. 113-114). We set E per dimension :
+#
+#   1D  (linear / chain lattice - e.g. a FREQUENCY profile, a TIME course, a TBSS-like skeleton) :
+#         E = 1.0  -- FSL randomise's 1D/TBSS convention (`--T2`, H=2 E=1) and Mensen & Khatami 2013
+#         "TFCE-B" (E=1, H=2), the empirically best-performing EEG setting (rank 1 on MCC, p. 114).
+#   2D  (surface / lattice - e.g. EEG channels x frequency, a cortical surface, a spatio-spectral map):
+#         E = 2/3  -- Mensen & Khatami 2013 "TFCE-A" (E=2/3, H=2), the theoretically-derived
+#         (Smith & Nichols) value and the most CONSISTENT across sources / SNR (p. 113-114).
+#   3D  (volume - e.g. an fMRI / VBM voxel grid) :
+#         E = 0.5  -- Smith & Nichols 2009 fMRI default (FSL randomise default, H=2 E=0.5).
+#
+# Our pipeline uses only 1D (density L3 = frequency chain) and 2D (node L2 = spatial x frequency) ;
+# 3D is documented for completeness and reachable only by explicit override (TFCE_DIM=3 or dim=3),
+# since element degree alone cannot separate a dense 2D lattice from a 3D volume.
+TFCE_H = 2.0                                            # height exponent (all dimensions)
+TFCE_E_1D = 1.0                                         # extent exponent, linear/chain lattice (1D)
+TFCE_E_2D = 2.0 / 3.0                                   # extent exponent, surface/lattice (2D)
+TFCE_E_3D = 0.5                                         # extent exponent, volume (3D)
+TFCE_E = TFCE_E_2D                                      # neutral fallback when dimensionality unknown
+TFCE_STEPS = int(os.environ.get("TFCE_STEPS", 50))     # height discretisation steps (cost knob ; env-tunable
+#   for heavy sweeps - the Riemann sum converges, so 25-50 is ample, lower = faster/coarser)
+
+
+def tfce_e_for(adjacency, *, dim=None):
+    """TFCE extent exponent E for the element lattice DIMENSIONALITY (H = TFCE_H always). `dim`
+    (1|2|3) or the env TFCE_DIM force the choice ; otherwise the dimensionality is inferred from the
+    adjacency : a path/chain (max off-diagonal degree <= 2) is 1D -> E=1 ; anything denser is treated
+    as a 2D surface/lattice -> E=2/3. A true 3D volume (E=0.5) must be requested explicitly, as degree
+    alone cannot tell a dense 2D lattice from a 3D one. Refs : Smith & Nichols (2009) ; Mensen &
+    Khatami (2013, p. 113-114 : TFCE-A E=2/3, TFCE-B E=1) ; FSL randomise (`--T2` E=1 for TBSS)."""
+    if dim is None:
+        dim = int(os.environ.get("TFCE_DIM", 0)) or None
+    if dim == 1:
+        return TFCE_E_1D
+    if dim == 2:
+        return TFCE_E_2D
+    if dim == 3:
+        return TFCE_E_3D
+    A = adjacency
+    try:
+        deg = np.asarray(A.sum(axis=1)).ravel()
+        diag = np.asarray(A.diagonal()).ravel() if hasattr(A, "diagonal") else np.diag(np.asarray(A))
+    except Exception:
+        A = np.asarray(A, dtype=float); deg = A.sum(1); diag = np.diag(A)
+    dmax = float(np.max(deg - diag)) if deg.size else 0.0
+    return TFCE_E_1D if dmax <= 2.0 + 1e-9 else TFCE_E_2D   # chain -> 1D, else 2D (our case)
+
+
+def _tfce_map(stat, labeler, tail, signed, *, E=TFCE_E, H=TFCE_H, n_steps=TFCE_STEPS):
+    """TFCE-enhanced map for one direction. `stat` is the per-element statistic ; `labeler(mask) ->
+    component labels` supplies the adjacency. For a signed statistic the height is oriented to the
+    tested tail (pos -> stat, neg -> -stat) ; unsigned (F) uses stat directly. Only positive heights
+    contribute. Returns the enhanced map (>= 0), same shape as `stat`."""
+    if signed:
+        h_elem = stat if tail == "pos" else (-stat if tail == "neg" else np.abs(stat))
+    else:
+        h_elem = stat
+    h_elem = np.maximum(np.asarray(h_elem, float), 0.0)
+    hmax = float(h_elem.max()) if h_elem.size else 0.0
+    out = np.zeros_like(h_elem)
+    if hmax <= 0:
+        return out
+    dh = hmax / n_steps
+    for step in range(1, n_steps + 1):                 # heights dh, 2dh, ..., hmax (midpoint-free Riemann sum)
+        h = step * dh
+        supra = h_elem >= h
+        if not supra.any():
+            continue
+        labels = labeler(supra)
+        # extent^E * h^H * dh, added to every member of each component. Vectorised over components
+        # via bincount rather than looped per label : `sizes[labels]` gives each element the extent
+        # of ITS component in one pass. Arithmetically identical to the per-label loop, and the
+        # loop was measurable - this map is evaluated n_steps times per permutation.
+        sizes = np.bincount(labels)
+        if sizes.size > 1:                             # at least one component above this height
+            out += np.where(labels > 0, (sizes[labels] ** E) * (h ** H) * dh, 0.0)
+    return out
+
+
+def _tfce_run(stat_obs, statmap, Y, Z, pZ, labeler, *, signed, tail, n_perm, alpha, seed,
+              scheme, ds_labels, restat, tfce_e=None, perm=None, relabel=None):
+    """Threshold-free counterpart of the fixed-threshold body of cluster_run : enhance the observed
+    map, build the max-TFCE permutation null (same FL / Draper-Stoneman schemes), then a per-element
+    FWER p = fraction of permuted max-TFCE >= the element's TFCE. Significant elements are grouped
+    into clusters for REPORTING only (each cluster's p = its min element p). Returns the cluster_run
+    keys (+ 'tfce', 'tfce_obs', 'p_elem'). `tfce_e` = extent exponent E (dimensionality-dependent,
+    resolved by the caller via tfce_e_for) ; None falls back to the neutral TFCE_E."""
+    E = TFCE_E if tfce_e is None else float(tfce_e)
+    tfce_obs = _tfce_map(stat_obs, labeler, tail, signed, E=E)
+    rng = np.random.default_rng(seed)
+    null_max = np.empty(n_perm)
+    perm = block_permuter() if perm is None else perm
+    if scheme is not None:                             # design-based randomization (Draper-Stoneman)
+        relabel = (lambda r: scheme(np.asarray(ds_labels), r)) if relabel is None else relabel
+        for k in range(n_perm):
+            s = restat(relabel(rng))(Y)
+            null_max[k] = _tfce_map(s, labeler, tail, signed, E=E).max()
+    else:                                              # Freedman-Lane residual permutation
+        fit = Z @ (pZ @ Y) if Z.shape[1] else np.zeros_like(Y)
+        resid = Y - fit
+        for k in range(n_perm):
+            s = statmap(fit + resid[perm(rng, Y.shape[0])])
+            null_max[k] = _tfce_map(s, labeler, tail, signed, E=E).max()
+    # per-element FWER-corrected p (element's TFCE vs the max-TFCE null)
+    p_elem = (1 + (null_max[None, :] >= tfce_obs[:, None]).sum(axis=1)) / (n_perm + 1)
+    sig = p_elem < alpha
+    comp_labels = labeler(sig)                         # cluster the significant elements (reporting)
+    comp_scores, comp_pvals = {}, {}
+    for lab in np.unique(comp_labels[comp_labels > 0]):
+        m = comp_labels == lab
+        comp_scores[int(lab)] = float(tfce_obs[m].sum())    # cluster TFCE mass
+        comp_pvals[int(lab)] = float(p_elem[m].min())       # cluster p = min element p
+    sizes_obs = np.array([int((comp_labels == L).sum())
+                          for L in np.unique(comp_labels[comp_labels > 0])], dtype=int)
+    return {"stat": stat_obs, "thresh": float("nan"), "tfce": True, "tfce_obs": tfce_obs,
+            "p_elem": p_elem, "comp_labels": comp_labels, "comp_pvals": comp_pvals,
+            "sig_edges": sig, "sizes_obs": sizes_obs, "comp_scores": comp_scores,
+            "cluster_stat": "tfce", "null_max": null_max, "signed": bool(signed)}
+
+
 def _edge_trend_t(effects, x):
     """Pearson t (and r) of (x vs effect) per element. effects (n_sessions, n_elements).
     Kept for the trend wrapper's reporting (r alongside the GLM t)."""
@@ -146,11 +481,22 @@ def _edge_trend_t(effects, x):
 # ---------------------------------------------------------------------------
 # GLM statistic map + cluster permutation
 # ---------------------------------------------------------------------------
-def _glm_statmap(Y, design, test_cols, nuisance_cols, stat, thresh, primary_p):
+def _glm_statmap(Y, design, test_cols, nuisance_cols, stat, thresh, primary_p, vg=None):
     """Build the per-element GLM statistic map + reduced model, shared by network and
-    spatial engines. Returns (statmap, Y, Z, pZ, thresh, signed)."""
-    if primary_p == "TFCE":                           # TODO: threshold-free cluster enhancement
-        raise NotImplementedError("primary_p='TFCE' (threshold-free) not implemented yet - TODO")
+    spatial engines. Returns (statmap, Y, Z, pZ, thresh, signed).
+
+    stat : 'F'  classic F / signed t   - assumes ONE variance for all observations.
+           'W'  robust Wald, White (1980) HC0 - one variance per OBSERVATION, no structure.
+           'G'  Winkler et al. (2014) Eq. 6-7 - one variance per VARIANCE GROUP `vg`. Pivotal
+                under heteroscedasticity where F is not. With a single VG it reduces exactly to F
+                (and to t^2 when one column is tested), so 'G' with vg=None is not an error, it is
+                simply F computed the long way.
+           'rank' F on ranks (monotone-robust).
+    vg   : variance-group label per observation, length n. Required by 'G' to be informative.
+           Winkler et al. (2015) constrains it : any two observations that the exchangeability
+           blocks allow to be swapped MUST share a variance group, so vg is normally the
+           permutation block itself (here : the subject, or the subject x session).
+    """
     from scipy.stats import f as _fdist, t as _tdist, norm as _ndist, chi2 as _chi2, rankdata
     Y = np.asarray(Y, dtype=float)
     if stat == "rank":                                # monotone-robust : work on ranks
@@ -167,7 +513,7 @@ def _glm_statmap(Y, design, test_cols, nuisance_cols, stat, thresh, primary_p):
         raise ValueError("need >= 1 tested column and enough observations")
     # A robust Wald W with a single tested column is a SIGNED statistic (sign of beta), so it
     # shares the two-tailed pos/neg cluster path of t ; a multi-column W is chi2 (unsigned like F).
-    signed = stat in ("t", "rank") or (stat == "W" and p_x == 1)
+    signed = stat in ("t", "rank") or (stat in ("W", "G") and p_x == 1)
     if stat in ("t", "rank") and p_x != 1:
         raise ValueError("stat 't' / 'rank' expects exactly one tested column")
     pD = np.linalg.pinv(D)
@@ -205,7 +551,64 @@ def _glm_statmap(Y, design, test_cols, nuisance_cols, stat, thresh, primary_p):
             W[v] = float(bv @ np.linalg.solve(Omega, bv))
         return W
 
-    statmap = statmap_W if stat == "W" else statmap_F
+    # ---- G : Winkler et al. 2014, Eq. 6-7 -------------------------------------------------
+    # G = [b' (C (M'WM)^-1 C')^-1 b] / (Lambda * rank(C)), W diagonale = 1/variance du groupe.
+    # M'WM se factorise en somme ponderee de matrices FIXES : M'WM = sum_g w_g * (M_g' M_g), donc
+    # les A_g se precalculent une fois et seule la ponderation depend de l'element.
+    if vg is not None:
+        _vg = np.asarray(vg)
+        _groups = list(dict.fromkeys(_vg.tolist()))
+        _rows = [np.where(_vg == g)[0] for g in _groups]
+        _A = np.stack([D[r].T @ D[r] for r in _rows])                  # (n_g, k, k)
+        # Degres de liberte EFFECTIFS du groupe : somme de la diagonale de la matrice residuelle
+        # R = I - M(M'M)^-1 M' restreinte au groupe. Les residus proviennent de l'ajustement GLOBAL
+        # sur les n observations, pas d'un ajustement par groupe : `n_g - rang(M_g)` sur-estimerait
+        # alors les ddl et sous-estimerait la variance du groupe, ce qui detruit la pivotalite.
+        _hii = np.einsum("ij,ji->i", D, pD)                            # levier de chaque ligne
+        _dof = np.array([max((1.0 - _hii[r]).sum(), 1e-6) for r in _rows], float)
+    else:
+        _rows, _A, _dof = None, None, None
+
+    def statmap_G(Yv):
+        """G de Winkler : F generalise a plusieurs groupes de variance, pivotal sous
+        heteroscedasticite. Un seul groupe -> Lambda = 1 et G = F exactement."""
+        if _rows is None:                       # aucun groupe declare : G est F
+            return statmap_F(Yv)
+        beta_ols = pD @ Yv                                               # (k, n_elem)
+        E2 = (Yv - D @ beta_ols) ** 2                                    # (n, n_elem)
+        # variance par groupe et par element, puis poids w_g = 1 / sigma2_g
+        s2 = np.stack([E2[r].sum(axis=0) / d for r, d in zip(_rows, _dof)])   # (n_g, n_elem)
+        w = 1.0 / np.maximum(s2, 1e-24)                                  # (n_g, n_elem)
+        MWM = np.einsum("gv,gij->vij", w, _A)                            # (n_elem, k, k)
+        inv = np.linalg.pinv(MWM)
+        # psi_hat est l'estimateur PONDERE (M'WM)^-1 M'W Y, pas celui des moindres carres
+        # ordinaires : la covariance du denominateur est celle du modele pondere, apparier les deux
+        # est ce qui rend G pivotal. Avec un seul groupe les deux estimateurs coincident, si bien
+        # qu'un test a un seul VG ne revele pas la confusion.
+        MWY = np.einsum("gv,gkv->kv", w,
+                        np.stack([D[r].T @ Yv[r] for r in _rows]))       # (k, n_elem)
+        beta = np.einsum("vij,jv->iv", inv, MWY)                         # (k, n_elem)
+        sub = inv[:, test_cols][:, :, test_cols]                         # (n_elem, p_x, p_x)
+        b = beta[test_cols].T                                            # (n_elem, p_x)
+        if p_x == 1:
+            v = np.maximum(sub[:, 0, 0], 1e-24)
+            g = (b[:, 0] ** 2) / v
+        else:
+            g = np.einsum("vi,vij,vj->v", b, np.linalg.pinv(sub), b)
+        # Correction de Welch. Elle s'annule si p_x == 1 ou si un seul groupe porte tout le poids.
+        s_rank = float(p_x)
+        if p_x > 1 and len(_rows) > 1:
+            n_g = np.array([len(r) for r in _rows], float)[:, None]
+            tr = (w * n_g).sum(axis=0)                                   # trace(W) par element
+            frac = (w * n_g) / np.maximum(tr, 1e-24)
+            lam = 1.0 + (2 * (s_rank - 1) / (s_rank * (s_rank + 2))) * \
+                  ((1.0 - frac) ** 2 / _dof[:, None]).sum(axis=0)
+        else:
+            lam = 1.0
+        g = g / (lam * s_rank)
+        return np.sign(b[:, 0]) * np.sqrt(np.maximum(g, 0.0)) if p_x == 1 else g
+
+    statmap = {"W": statmap_W, "G": statmap_G}.get(stat, statmap_F)
 
     def effmap(Yv):
         """Per-element EFFECT ESTIMATE = coefficient of the tested column (signed t / rank / W
@@ -215,20 +618,27 @@ def _glm_statmap(Y, design, test_cols, nuisance_cols, stat, thresh, primary_p):
             return np.full(Yv.shape[1], np.nan)
         return (pD @ Yv)[tcol]
 
-    if thresh is None:
+    if primary_p == "TFCE":                           # threshold-free : no cluster-forming threshold ;
+        thresh = "TFCE"                               # sentinel -> cluster_run takes the _tfce_run path
+    elif thresh is None:
         if stat == "W":                               # signed W ~ N(0,1) ; multi-column W ~ chi2(p_x)
             thresh = (float(_ndist.ppf(1 - primary_p)) if p_x == 1
                       else float(_chi2.ppf(1 - primary_p, p_x)))
+        elif stat == "G":                             # G est normalise par rank(C) : chi2/p_x ;
+            thresh = (float(_ndist.ppf(1 - primary_p)) if p_x == 1   # signe -> N(0,1) comme W
+                      else float(_chi2.ppf(1 - primary_p, p_x)) / p_x)
         elif not signed:
             thresh = float(_fdist.ppf(1 - primary_p, p_x, df2))
         else:
             thresh = float(_tdist.ppf(1 - primary_p, df2))
-    return statmap, effmap, Y, Z, pZ, float(thresh), signed
+    ret_thresh = thresh if isinstance(thresh, str) else float(thresh)
+    return statmap, effmap, Y, Z, pZ, ret_thresh, signed
 
 
 def cluster_run(statmap, Y, Z, pZ, labeler, *, thresh, signed, tail,
                 n_perm, alpha, seed, cluster_stat="size",
-                scheme=None, ds_labels=None, restat=None):
+                scheme=None, ds_labels=None, restat=None, tfce_e=None,
+                blocks=None, exchange="within", units=None):
     """Observed statistic -> primary threshold -> connected components (via `labeler`) ->
     permutation null of the largest component -> cluster-level FWER.
 
@@ -248,8 +658,39 @@ def cluster_run(statmap, Y, Z, pZ, labeler, *, thresh, signed, tail,
         scalar randomization_test so both layers draw from the SAME reference set.
     cluster_stat : 'size' (extent) | 'intensity' (mass). None (no clustering) is an OFF switch
     handled by the caller (templates skip), not reached here.
+
+    Two-tailed signed test (tail='both') : run the POSITIVE and NEGATIVE directions as two separate
+    one-sided passes, each clustered on its own supra map and judged against its OWN same-sign
+    max-cluster null (Zalesky NBS / sign-separated Maris-Oostenveld), then merged. Never fuses an
+    adjacent pos and neg element into one blob nor lets one sign's strong cluster inflate the other.
+
+    EXCHANGEABILITY (`blocks`, `exchange`, `units`). Both nulls above rearrange the n ROWS of Y.
+    Left free - the default, and the only behaviour available before - that rearrangement asserts
+    that the rows are exchangeable with one another, which holds for the repeated measures of ONE
+    unit and fails as soon as Y stacks several : the null then loses the within-unit dependence the
+    observed statistic keeps, and the test turns anti-conservative. Pass `blocks` (one label per
+    row) to restrict the rearrangement to Winkler's exchangeability blocks, `exchange` to pick the
+    regime, and `units` to say inside what the blocks may be exchanged. See `block_permuter`.
+    Defaults keep the free permutation, so every existing call is unchanged.
     """
+    if signed and tail == "both":
+        one = dict(thresh=thresh, signed=signed, n_perm=n_perm, alpha=alpha, seed=seed,
+                   cluster_stat=cluster_stat, scheme=scheme, ds_labels=ds_labels, restat=restat,
+                   tfce_e=tfce_e, blocks=blocks, exchange=exchange, units=units)
+        rp = cluster_run(statmap, Y, Z, pZ, labeler, tail="pos", **one)
+        rn = cluster_run(statmap, Y, Z, pZ, labeler, tail="neg", **one)
+        return _merge_directions(rp, rn)
     stat_obs = statmap(Y)
+    # One generator per run, built before either branch, so the fixed-threshold and the
+    # threshold-free paths draw from the SAME reference set for the same arguments.
+    perm = block_permuter(blocks, exchange=exchange, units=units)
+    relabel = (scheme_by_block(scheme, ds_labels, blocks, exchange=exchange, units=units)
+               if scheme is not None else None)
+    if isinstance(thresh, str) and thresh == "TFCE":  # threshold-free : integrate over all heights
+        return _tfce_run(stat_obs, statmap, Y, Z, pZ, labeler, signed=signed, tail=tail,
+                         n_perm=n_perm, alpha=alpha, seed=seed,
+                         scheme=scheme, ds_labels=ds_labels, restat=restat, tfce_e=tfce_e,
+                         perm=perm, relabel=relabel)
     comp_labels = labeler(_supra(stat_obs, tail, thresh, signed))
     sizes_obs = np.array([int((comp_labels == L).sum())
                           for L in np.unique(comp_labels[comp_labels > 0])], dtype=int)
@@ -262,26 +703,28 @@ def cluster_run(statmap, Y, Z, pZ, labeler, *, thresh, signed, tail,
         # ORIGINAL data (the nuisance stays in the model, partialled out each refit). Honours
         # block / max-consecutive schedules that the FL residual permutation cannot. Same
         # reference set as the scalar randomization_test (shared scheme generators).
-        labels = np.asarray(ds_labels)
         for k in range(n_perm):
-            s = restat(scheme(labels, rng))(Y)
+            s = restat(relabel(rng))(Y)
             sc = _component_scores(labeler(_supra(s, tail, thresh, signed)), s, cluster_stat)
             null_max[k] = max(sc.values()) if sc else 0.0
     else:
-        # Freedman-Lane residual permutation (free exchangeability given the nuisance). Exact
-        # reference set for a count-balanced design with no schedule constraint.
+        # Freedman-Lane residual permutation, restricted to the exchangeability blocks when
+        # `blocks` is given (free otherwise). Exact reference set for a count-balanced design with
+        # no schedule constraint.
         fit = Z @ (pZ @ Y) if Z.shape[1] else np.zeros_like(Y)
         resid = Y - fit
-        order = np.arange(Y.shape[0])
         for k in range(n_perm):
-            rng.shuffle(order)
-            s = statmap(fit + resid[order])
+            s = statmap(fit + resid[perm(rng, Y.shape[0])])
             sc = _component_scores(labeler(_supra(s, tail, thresh, signed)), s, cluster_stat)
             null_max[k] = max(sc.values()) if sc else 0.0
     comp_pvals, sig_mask = _component_pvals(comp_labels, obs_scores, null_max, n_perm, alpha)
+    # `signed` is carried into the result because downstream consumers cannot re-derive it: a
+    # single-column W / G is a SIGNED robust ratio, a multi-column one is an unsigned chi2, and both
+    # arrive here as stat_kind='W'. Only the former has a coefficient, hence an effect size.
     return {"stat": stat_obs, "thresh": float(thresh), "comp_labels": comp_labels,
             "comp_pvals": comp_pvals, "sig_edges": sig_mask, "sizes_obs": sizes_obs,
-            "comp_scores": obs_scores, "cluster_stat": cluster_stat, "null_max": null_max}
+            "comp_scores": obs_scores, "cluster_stat": cluster_stat, "null_max": null_max,
+            "signed": bool(signed)}
 
 
 def breusch_pagan_map(Y, design, *, sig_mask=None):
@@ -315,102 +758,6 @@ def breusch_pagan_map(Y, design, *, sig_mask=None):
             "median_p": float(np.median(sel))}
 
 
-# ---------------------------------------------------------------------------
-# Change-point (relu / hinge) cluster test : appearance at an UNKNOWN onset.
-# The general hinge math lives in functions.sced.cluster.changepoint (domain-neutral) ; here we
-# only wrap it with the permutation null + adjacency.
-# ---------------------------------------------------------------------------
-def _default_hinge_Z(time, adjust_time):
-    """Default reduced model when the caller passes no Z : [1] (flat -> ramp) or [1, time]
-    (broken-line change of slope)."""
-    n = np.asarray(time).size
-    return (np.column_stack([np.ones(n), np.asarray(time, float)]) if adjust_time
-            else np.ones((n, 1)))
-
-
-def relu_run(Y, time, labeler, *, Z=None, onsets=None, adjust_time=False, t_thresh=None,
-             primary_p=0.001, n_perm=1000, alpha=0.05, tail="both", seed=0,
-             cluster_stat="size"):
-    """Change-point (relu / hinge) cluster test on ELEMENTS with a given adjacency labeler.
-
-    Per-element statistic = SUP over candidate onsets of the partial t of the hinge column
-    relu_k(t) = max(0, time - onset_k) beyond the reduced model Z. Z defaults to [1] (or [1, time]
-    if adjust_time) ; pass an explicit Z to adjust the change-point for ARBITRARY covariates (e.g.
-    a phase factor + the linear time), which keeps the onset consistent with an ANCOVA. The
-    breakpoint search is absorbed by the Freedman-Lane permutation : cluster_run recomputes the
-    SAME sup on the permuted reduced-model residuals, so the cluster FWER stays valid.
-
-    `labeler(supra_mask) -> component labels` abstracts the adjacency (edge_components for a graph,
-    adjacency_components for an element grid). Returns the cluster_run keys plus 'onsets' (candidate
-    grid), 'onset' / 'slope' (per-element best onset and hinge slope, full maps) and 'onset_hat' /
-    'slope_hat' (the same, masked to NaN off the significant cluster)."""
-    from scipy.stats import t as _tdist
-    from .changepoint import hinge_fits, hinge_sup, hinge_betas
-    Y = np.asarray(Y, dtype=float)
-    if Z is None:
-        Z = _default_hinge_Z(time, adjust_time)
-    Zf, pZ, df2, fits, onsets = hinge_fits(time, onsets, Z)
-    statmap, t_per_k = hinge_sup(Zf, pZ, df2, fits, tail)
-    thresh = float(t_thresh) if t_thresh is not None else float(_tdist.ppf(1 - primary_p, df2))
-    res = cluster_run(statmap, Y, Zf, pZ, labeler, thresh=thresh, signed=True, tail=tail,
-                      n_perm=n_perm, alpha=alpha, seed=seed, cluster_stat=cluster_stat)
-    ts_obs = np.stack([t_per_k(Y, D, pD, tcol) for D, pD, tcol in fits], axis=0)
-    kidx = np.argmax(np.abs(ts_obs), axis=0)            # per-element best onset index
-    best = onsets[kidx]
-    slope = np.take_along_axis(hinge_betas(Y, fits), kidx[None, :], axis=0)[0]  # beta at best onset
-    sig = res["sig_edges"]
-    res["onsets"] = onsets                              # candidate grid
-    res["onset"] = best                                 # per-element best onset (full map)
-    res["onset_hat"] = np.where(sig, best, np.nan)      # masked to the significant cluster
-    res["slope"] = slope                                # per-element hinge slope (full map)
-    res["slope_hat"] = np.where(sig, slope, np.nan)     # masked to the significant cluster
-    return res
-
-
-def scalar_relu(y, time, *, onsets=None, adjust_time=False, t_thresh=None, primary_p=0.001,
-                n_perm=1000, alpha=0.05, tail="both", seed=0):
-    """Change-point (relu / hinge) test on a SINGLE scalar time series - no adjacency, no cluster.
-
-    Scalar sibling of nbs_relu / spatial_relu : y (n_sessions,) is one outcome per session
-    (density, laterality index, accuracy ...). Tests whether the outcome APPEARS or bends at an
-    unknown onset ; with a single element the cluster machinery collapses to a plain permutation
-    p of the sup-over-onsets statistic (Freedman-Lane residual permutation, which absorbs the
-    breakpoint search). adjust_time keeps a linear time nuisance (broken-line change of slope).
-
-    Returns : onset_hat (best onset), slope_hat (hinge slope = post-onset rate, or slope change
-    if adjust_time), t (sup statistic), p (permutation p), thresh (primary t for reference),
-    onsets (candidate grid)."""
-    from scipy.stats import t as _tdist
-    from .changepoint import hinge_fits, hinge_sup, hinge_betas
-    y = np.asarray(y, dtype=float).reshape(-1, 1)       # (n_sessions, 1 element)
-    Z, pZ, df2, fits, onsets = hinge_fits(time, onsets, _default_hinge_Z(time, adjust_time))
-    statmap, t_per_k = hinge_sup(Z, pZ, df2, fits, tail)
-    t_obs = float(statmap(y)[0])
-    fit = Z @ (pZ @ y)                                  # reduced-model fit (nuisance kept)
-    resid = y - fit
-    rng = np.random.default_rng(seed)
-    order = np.arange(y.shape[0])
-    null = np.empty(n_perm)
-    for k in range(n_perm):                             # Freedman-Lane null of the sup statistic
-        rng.shuffle(order)
-        null[k] = float(statmap(fit + resid[order])[0])
-    if tail == "pos":
-        p = (1 + np.sum(null >= t_obs)) / (n_perm + 1)
-    elif tail == "neg":
-        p = (1 + np.sum(null <= t_obs)) / (n_perm + 1)
-    else:
-        p = (1 + np.sum(np.abs(null) >= abs(t_obs))) / (n_perm + 1)
-    ts = np.array([t_per_k(y, D, pD, tcol)[0] for D, pD, tcol in fits])
-    kidx = int(np.argmax(np.abs(ts)))                   # best onset for the single series
-    slope = float(hinge_betas(y, fits)[kidx, 0])
-    thresh = float(t_thresh) if t_thresh is not None else float(_tdist.ppf(1 - primary_p, df2))
-    return {"onset_hat": float(onsets[kidx]), "slope_hat": slope, "t": t_obs, "p": float(p),
-            "onsets": onsets, "thresh": thresh, "null_max": null}
-
-
-# ---------------------------------------------------------------------------
-# Model terms (named effect / nuisance -> design columns)
-# ---------------------------------------------------------------------------
 def _term_matrix(values, kind):
     """Design columns for one model term. Returns (columns (n, k), is_discrete).
 
@@ -495,7 +842,7 @@ def huh_jhun_whiten(Y, effect, nuisance, effect_kind, nuisance_kind, stat):
 
 
 def build_scheme(Y, effect, nuisance, effect_kind, nuisance_kind, stat, test_cols, nuis_cols,
-                 thresh, primary_p, perm_method, block_size, max_consecutive):
+                 thresh, primary_p, perm_method, block_size, max_consecutive, vg=None):
     """Design-based randomization schedule for the cluster null, or None to keep Freedman-Lane.
 
     Returns (scheme, ds_labels, restat) to hand to cluster_run. A schedule is used when the
@@ -506,6 +853,10 @@ def build_scheme(Y, effect, nuisance, effect_kind, nuisance_kind, stat, test_col
     the cluster test and run_sced_alternating draw the same admissible relabelings. ``restat``
     rebuilds the effect design column from the permuted labels and returns a fresh statmap on
     the ORIGINAL data (Draper-Stoneman : permute labels, refit, keep the nuisance in the model).
+
+    ``stat`` et ``vg`` sont ceux de _glm_statmap et traversent tels quels : la carte recalculee a
+    chaque relabelisation emploie donc la MEME statistique (et les memes groupes de variance) que la
+    carte observee, ce qui est la condition pour que le nul soit celui de la statistique rapportee.
     """
     design_based = (perm_method in ("draper-stoneman", "randomization")
                     or block_size is not None or max_consecutive is not None)
@@ -522,7 +873,7 @@ def build_scheme(Y, effect, nuisance, effect_kind, nuisance_kind, stat, test_col
     def restat(perm_labels):
         design, _tc, _nc, _st = _fl_design(Y, perm_labels, nuisance, effect_kind,
                                            nuisance_kind, stat)
-        return _glm_statmap(Y, design, test_cols, nuis_cols, stat, thresh, primary_p)[0]
+        return _glm_statmap(Y, design, test_cols, nuis_cols, stat, thresh, primary_p, vg)[0]
 
     return scheme, labels, restat
 
@@ -554,7 +905,8 @@ def _contrast_design(Y, factor, contrast, cond_order, nuisance, nuisance_kind):
 
 
 def build_contrast_scheme(Y, factor, contrast, cond_order, nuisance, nuisance_kind,
-                          perm_method, block_size, max_consecutive, thresh, primary_p):
+                          perm_method, block_size, max_consecutive, thresh, primary_p,
+                          stat="t", vg=None):
     """Draper-Stoneman randomization schedule for ONE ANCOVA contrast within a RANDOMIZED factor.
 
     Unlike build_scheme (which permutes the tested column), the scheme here permutes the WHOLE
@@ -563,13 +915,17 @@ def build_contrast_scheme(Y, factor, contrast, cond_order, nuisance, nuisance_ki
     other-level dummies move together and stay mutually exclusive. The null is thus the
     randomization distribution of the factor (Edgington), not a free permutation of a binary dummy.
     Returns (scheme, factor_labels, restat) to hand to cluster_run. FL is used when perm_method is
-    'freedman-lane' and no schedule constraint is set (handled by the caller)."""
+    'freedman-lane' and no schedule constraint is set (handled by the caller).
+
+    ``stat`` (defaut 't', le t signe du contraste) et ``vg`` sont ceux de _glm_statmap : la carte
+    recalculee a chaque relabelisation emploie la meme statistique et les memes groupes de variance
+    que la carte observee."""
     from ..core import alternating_scheme, block_scheme
     scheme = block_scheme(block_size) if block_size else alternating_scheme(max_consecutive)
     factor = np.asarray([str(x) for x in factor])
 
     def restat(perm_factor):
         design, tc, nc = _contrast_design(Y, perm_factor, contrast, cond_order, nuisance, nuisance_kind)
-        return _glm_statmap(Y, design, tc, nc, "t", thresh, primary_p)[0]
+        return _glm_statmap(Y, design, tc, nc, stat, thresh, primary_p, vg)[0]
 
     return scheme, factor, restat

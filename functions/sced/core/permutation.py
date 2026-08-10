@@ -27,6 +27,31 @@ from .nuisance import (
 from .effect_sizes import hedges_g
 
 
+def _require_schedule_aware_method(method, max_consecutive, block_size):
+    """Guard: a schedule constraint can only be honoured by the label-permutation
+    (Draper-Stoneman) route.
+
+    In: the resolved method string and the two schedule constraints. Out: None; RAISES
+    ValueError when a constraint was declared alongside Freedman-Lane. Side effect: none.
+
+    Freedman-Lane permutes the reduced-model residuals, so ``max_consecutive`` / ``block_size``
+    have no effect on its reference set. Accepting them silently produced a p computed under a
+    schedule the study never used, while the report still displayed the constraint as applied
+    (Edgington & Onghena 2007: the reference set must mirror the assignment actually made)."""
+    if method not in ("freedman-lane", "fl"):
+        return
+    declared = [n for n, v in (("max_consecutive", max_consecutive),
+                               ("block_size", block_size)) if v]
+    if declared:
+        raise ValueError(
+            f"{' and '.join(declared)} is a randomisation-schedule constraint that the "
+            "Freedman-Lane residual null cannot honour: FL permutes reduced-model residuals, "
+            "not the condition labels, so the constraint would be silently ignored and the "
+            "p-value would not correspond to the schedule actually used. Pass "
+            "method='draper-stoneman' (the design-based route, exact for a randomised SCED) "
+            "or drop the constraint if the assignment really was unconstrained.")
+
+
 def condition_permutation_test(values, labels, sessions, *, detrend="none",
                                method="draper-stoneman", n_perm=5000,
                                max_consecutive=None, block_size=None, covariates=None,
@@ -123,6 +148,7 @@ def condition_permutation_test(values, labels, sessions, *, detrend="none",
     exact = False
     n_eval = n_perm
     m = method.lower().replace("_", "-")
+    _require_schedule_aware_method(m, max_consecutive, block_size)
     if m in ("draper-stoneman", "ds"):
         rss_red = _rss_design(Z, values)          # Y and Z fixed -> constant
         scheme = (block_scheme(block_size) if block_size
@@ -329,6 +355,7 @@ def stratified_condition_permutation_test(values, labels, units, sessions, *,
     idx = {u: np.where(units == u)[0] for u in uniq_u}
     ge = 0
     m = method.lower().replace("_", "-")
+    _require_schedule_aware_method(m, max_consecutive, block_size)
     if m in ("draper-stoneman", "ds"):
         scheme = (block_scheme(block_size) if block_size
                   else alternating_scheme(max_consecutive=max_consecutive))
@@ -420,6 +447,45 @@ def huh_jhun_test(y, effect, nuisance=None, *, effect_kind="continuous", nuisanc
             "p": float(p), "n_perm": int(n_perm)}
 
 
+def freedman_lane_test(y, effect, nuisance=None, *, effect_kind="continuous",
+                       nuisance_kind="continuous", stat="W", n_perm=10000, tail="both", seed=0):
+    """SCALAR Freedman-Lane (1983) test of a FIXED nuisance-adjusted covariate (e.g. a session-time
+    trend adjusting for condition) - the scalar sibling of the cluster ``spatial_freedman_lane`` and
+    the exact twin of ``huh_jhun_test`` EXCEPT for the permutation null : FL permutes the residuals of
+    the REDUCED (nuisance-only) model and refits, WITHOUT the exchangeability whitening. Reuses the
+    same design/statistic core (``_fl_design`` + ``_glm_statmap``) so discrete nuisances (condition)
+    are expanded to dummies identically, and the robust HC0 Wald W is the same statistic.
+
+    Preferred over Huh-Jhun as the small-n primary : FL needs no covariance whitening, so its p is
+    stable to the outcome metric (raw contrast vs signed r2), where HJ's whitened p is fragile.
+
+    y : (n,) outcome. effect : (n,) tested fixed covariate. nuisance : (n,) array / list to adjust
+    for ; None = intercept only. Returns {scheme, stat, stat_kind, slope, p, n_perm}, same contract
+    as huh_jhun_test. References : Freedman & Lane (1983) ; Winkler et al. (2014)."""
+    from ..cluster.core import _fl_design, _glm_statmap
+    Y = np.asarray(y, dtype=float).reshape(-1, 1)
+    nuis = [] if nuisance is None else nuisance
+    design, test_cols, nuis_cols, stat = _fl_design(Y, effect, nuis, effect_kind, nuisance_kind, stat)
+    statmap, effmap, Yv, Z, pZ, _thr, signed = _glm_statmap(
+        Y, design, test_cols, nuis_cols, stat, None, 0.5)
+    n = Yv.shape[0]
+    if n - design.shape[1] <= 0:                              # nuisance saturates the design : no dof
+        return {"scheme": "freedman-lane", "stat": np.nan, "stat_kind": stat, "slope": np.nan,
+                "p": np.nan, "n_perm": 0}
+    reduced = Z @ (pZ @ Yv) if Z.shape[1] else np.zeros_like(Yv)   # nuisance fit (kept across perms)
+    resid = Yv - reduced                                     # reduced-model residuals (exchangeable)
+    obs = float(statmap(Yv)[0]); slope = float(effmap(Yv)[0])
+    rng = np.random.default_rng(seed)
+    null = np.array([statmap(reduced + resid[rng.permutation(n)])[0] for _ in range(n_perm)],
+                    dtype=float)
+    if signed:                                               # two-sided on the signed t / W
+        p = (1 + np.sum(np.abs(null) >= abs(obs) - 1e-12)) / (n_perm + 1)
+    else:                                                    # F / chi2 : upper tail
+        p = (1 + np.sum(null >= obs - 1e-12)) / (n_perm + 1)
+    return {"scheme": "freedman-lane", "stat": obs, "stat_kind": stat, "slope": slope,
+            "p": float(p), "n_perm": int(n_perm)}
+
+
 def recommend_scheme(*, role, kind, values=None, sessions=None, n=None, grouped=False, units=None,
                      detrend="linear", threshold=0.15, small_n=30):
     """UNIFIED permutation-scheme dispatcher for ONE model term - the single place that resolves
@@ -451,18 +517,20 @@ def recommend_scheme(*, role, kind, values=None, sessions=None, n=None, grouped=
                                                 threshold=threshold)["recommended_method"]
         return {"primary": rec, "candidates": ["draper-stoneman", "freedman-lane"],
                 "reason": f"randomized factor -> {rec} (design-based unless collinear with time)"}
-    # fixed covariate : Huh-Jhun (small n) vs Freedman-Lane, FL always kept as sensitivity
+    # fixed covariate : Freedman-Lane is ALWAYS the primary (robust, whitening-free), Huh-Jhun is
+    # kept only as a sensitivity comparator. The small-n Huh-Jhun rule was dropped : on few sessions
+    # (n<=~20) HJ's exchangeability whitening is estimated from a poorly-conditioned residual
+    # covariance, so the headline p becomes fragile to the outcome metric (raw contrast vs signed r2
+    # flip the HJ p while FL stays stable). FL + robust W is the stable primary ; HJ still runs in the
+    # {FL,HJ}x{F,W} grid and is reported alongside as sensitivity.
     nn = n if n is not None else (len(np.asarray(sessions)) if sessions is not None else None)
-    if nn is not None and nn <= small_n:
-        return {"primary": "huh-jhun", "candidates": ["freedman-lane", "huh-jhun"],
-                "reason": f"fixed covariate, small n={nn} -> Huh-Jhun (exact exchangeability ; FL sensitivity)"}
     return {"primary": "freedman-lane", "candidates": ["freedman-lane", "huh-jhun"],
-            "reason": f"fixed covariate, n={nn} -> Freedman-Lane (HJ as sensitivity)"}
+            "reason": f"fixed covariate, n={nn} -> Freedman-Lane primary (HJ as sensitivity)"}
 
 
 def heterogeneity_test(values, labels, units, sessions, *, conditions=None,
                        condition_order=None, dose=None,
-                       detrend="none", n_perm=5000, max_consecutive=None,
+                       detrend="none", n_perm=5000,
                        standardize=True, random_state=0):
     """
     Does the condition effect **vary across units** (unit x condition interaction)?
@@ -474,7 +542,10 @@ def heterogeneity_test(values, labels, units, sessions, *, conditions=None,
        **within unit** and the model refitted. This is **approximate**, not exact: the
        null here is "homogeneous effect" (a common effect may exist), which is *not*
        the sharp null, so label permutation would destroy the common effect - hence we
-       permute residuals (FL) rather than labels (Winkler et al. 2014).
+       permute residuals (FL) rather than labels (Winkler et al. 2014). Because the null is
+       necessarily residual-based, a schedule constraint cannot apply here: the former
+       ``max_consecutive`` argument was accepted and never used, and has been removed rather
+       than left to suggest a constraint the test does not honour.
     2. **Cochran's Q** (Cochran 1954) and **I^2** (Higgins & Thompson 2002) on the
        per-unit effect (target - reference mean, inverse-variance weighted) - the
        interpretable meta-analytic heterogeneity index.
@@ -902,6 +973,9 @@ def randomization_test(labels, values, *, statistic, scheme, n_perm=5000,
             "n_perm": int(n_valid), "two_sided": bool(two_sided)}
 
 
+_MAX_REJECTION_DRAWS = 200          # rejection-sampling budget per constrained draw
+
+
 def alternating_scheme(max_consecutive=None):
     """
     Randomization schedule for an alternating/N-of-1 design: reshuffle the
@@ -910,13 +984,20 @@ def alternating_scheme(max_consecutive=None):
     exceed that run length of an identical condition are rejected (mirrors the
     typical no-more-than-k-in-a-row constraint). Returns a ``scheme(labels, rng)``.
 
+    Rejection sampling keeps the draw UNIFORM over the constrained set, which is what makes
+    the test exact; when the budget of ``_MAX_REJECTION_DRAWS`` attempts is exhausted the
+    scheme RAISES rather than returning an unconstrained draw, since mixing inadmissible
+    assignments into the reference set silently invalidates the p-value. Use
+    ``count_admissible_assignments`` to check whether the constrained set is large enough
+    to be sampled (and to be tested) at all.
+
     References: Edgington & Onghena 2007 (completely-randomized SCED alternation schedule).
     R equivalent: SCRT (CRD alternation) - potential equivalent, to test.
     """
     def _scheme(labels, rng):
         if max_consecutive is None:
             return rng.permutation(labels)
-        for _ in range(50):
+        for _ in range(_MAX_REJECTION_DRAWS):
             perm = rng.permutation(labels)
             runs = 1
             ok = True
@@ -927,8 +1008,102 @@ def alternating_scheme(max_consecutive=None):
                     break
             if ok:
                 return perm
-        return rng.permutation(labels)  # fallback if constraint hard to satisfy
+        raise RuntimeError(
+            f"alternating_scheme: no draw satisfying max_consecutive={max_consecutive} was "
+            f"found in {_MAX_REJECTION_DRAWS} attempts. The constraint is too tight for "
+            "rejection sampling on this label vector, so the reference set cannot be sampled "
+            "uniformly. Call count_admissible_assignments(labels, max_consecutive=...) to see "
+            "how small the admissible set is (a design whose p-floor exceeds alpha cannot "
+            "support a randomization test at all), or use block_scheme(k) if the schedule was "
+            "block-randomised. Previously this fell back to an UNCONSTRAINED draw, which "
+            "silently mixed inadmissible assignments into the null.")
     return _scheme
+
+
+def _multiset_permutations(items):
+    """Yield each DISTINCT ordering of ``items`` exactly once (a multiset permutation), unlike
+    ``itertools.permutations`` which yields n! orderings with duplicates whenever labels repeat.
+
+    In: a sequence of hashable labels (the observed condition assignment).
+    Out: a generator of tuples. No side effect. Used only for counting/enumerating small
+    admissible sets, never in the permutation loop itself."""
+    pool = sorted(set(items), key=str)
+    counts = {c: list(items).count(c) for c in pool}
+    n = len(items)
+    out = []
+
+    def _rec():
+        if len(out) == n:
+            yield tuple(out)
+            return
+        for c in pool:
+            if counts[c]:
+                counts[c] -= 1
+                out.append(c)
+                yield from _rec()
+                out.pop()
+                counts[c] += 1
+
+    return _rec()
+
+
+def count_admissible_assignments(labels, *, block_size=None, max_consecutive=None,
+                                 enumerate_cap=200000):
+    """Size of the DESIGN's reference set ``m_t`` (the number of distinct condition assignments
+    the randomisation schedule could have produced) and the resulting p-value floor.
+
+    In: the observed ``labels`` (condition per session, in session order) plus the schedule
+    constraints actually used. Out: ``{m_t, exact, p_floor, basis}``; no side effect.
+
+    - unconstrained count-preserving relabeling -> multinomial ``n! / prod(n_c!)``, exact;
+    - ``block_size`` -> product of the per-block multinomials, exact (a block whose labels
+      repeat has fewer than ``block_size!`` distinct orders);
+    - ``max_consecutive`` -> has no closed form, so the distinct assignments are enumerated
+      and filtered when the multinomial is at most ``enumerate_cap``; beyond that the
+      multinomial is returned as an UPPER BOUND with ``exact=False``.
+
+    ``p_floor = 1 / (m_t + 1)`` is the smallest p the design can attain; when it exceeds the
+    intended alpha the study cannot yield a significant randomization test whatever the effect
+    size (Heyvaert & Onghena 2014: at least ~20 admissible assignments are needed at alpha=.05;
+    Levin et al. 2016; Phipson & Smyth 2010 for the (1+k)/(1+B) convention this floor sits
+    under). Reported for information: the engines keep the Monte-Carlo p, they do not switch
+    to k/m_t."""
+    labels = list(np.asarray(labels))
+    n = len(labels)
+    if n == 0:
+        return {"m_t": 0, "exact": True, "p_floor": np.nan, "basis": "empty"}
+
+    def _multinomial(seq):
+        m = math.factorial(len(seq))
+        for c in set(seq):
+            m //= math.factorial(list(seq).count(c))
+        return m
+
+    if block_size:
+        m_t, basis, exact = 1, f"within-block permutation (block_size={block_size})", True
+        for start in range(0, n, block_size):
+            m_t *= _multinomial(labels[start:start + block_size])
+    elif max_consecutive is not None:
+        total = _multinomial(labels)
+        if total <= enumerate_cap:
+            m_t, exact = 0, True
+            for perm in _multiset_permutations(labels):
+                runs, ok = 1, True
+                for i in range(1, n):
+                    runs = runs + 1 if perm[i] == perm[i - 1] else 1
+                    if runs > max_consecutive:
+                        ok = False
+                        break
+                m_t += 1 if ok else 0
+            basis = f"count-preserving relabeling with max_consecutive={max_consecutive}"
+        else:
+            m_t, exact = total, False
+            basis = (f"UPPER BOUND: unconstrained multinomial ({total} > enumerate_cap="
+                     f"{enumerate_cap}); the max_consecutive={max_consecutive} subset is smaller")
+    else:
+        m_t, exact, basis = _multinomial(labels), True, "count-preserving relabeling"
+    return {"m_t": int(m_t), "exact": bool(exact),
+            "p_floor": (1.0 / (m_t + 1)) if m_t else np.nan, "basis": basis}
 
 
 def block_scheme(block_size):
@@ -1045,3 +1220,80 @@ def sced_methods_text(*, design, n_units, conditions, outcome, detrend, method, 
         "Brossard et al., 2018 / Tarlow, 2016) complement the test descriptively. "
         "The retained improvement direction is '" + improvement + "'.")
     return " ".join(s)
+
+
+def perm_boot_slope_band(y, design, effect_col, units, predict_grid, *,
+                         n_perm=2000, n_boot=2000, seed=0):
+    """Design-based inference for a linear-model SLOPE, resampling-consistent (no Wald / normal
+    approximation) - the pair a SCED figure needs : a permutation p AND a matching confidence band.
+
+      p    : within-unit FREEDMAN-LANE permutation of the slope. Fit the reduced model (``design``
+             without ``effect_col``), permute its residuals WITHIN each unit, refit the full model and
+             read the slope ; the two-sided p is the share of |permuted slope| >= |observed|. Exact
+             under the null exchangeability of the within-unit residuals (Freedman & Lane, 1983).
+      band : within-unit RESIDUAL BOOTSTRAP of the group-mean prediction over ``predict_grid``. Resample
+             the full-model residuals WITH replacement within each unit, refit, predict ; the 95% band
+             is the 2.5-97.5 percentiles across resamples (Efron & Tibshirani, 1993). Full prediction
+             band (level + slope uncertainty) -> the classic hourglass with a NON-ZERO centre, unlike a
+             slope-only band. Both null and band condition on the observed units (fixed-effect /
+             conditional inference), so they are mutually consistent.
+
+    Parameters
+    ----------
+    y : (n,) outcome.
+    design : (n, p) full model design matrix (e.g. [unit dummies | effect | nuisance...]).
+    effect_col : int, the column of ``design`` holding the tested slope covariate.
+    units : (n,) unit (patient) label per row - defines the within-unit exchangeability blocks.
+    predict_grid : (g, p) design rows at which to predict the GROUP-MEAN line (e.g. unit dummies set to
+        1/n_units for the average intercept, the effect column swept over the axis, nuisance at ref/mean).
+    n_perm, n_boot : permutation / bootstrap resample counts. seed : RNG seed.
+
+    Returns
+    -------
+    dict : ``{"slope", "p", "band_lo", "band_hi", "yhat", "n_perm", "n_boot"}`` where ``yhat`` is the
+    observed group-mean line over ``predict_grid`` and ``band_lo``/``band_hi`` are the (g,) bootstrap
+    percentiles.
+
+    References: Freedman & Lane (1983) - residual permutation of a nuisance-adjusted slope - catalogued
+    and benchmarked against the other GLM-coefficient permutation schemes (Draper-Stoneman, Huh-Jhun,
+    ter Braak...) by Helwig (2019, doi:10.1016/j.neuroimage.2019.116030). The band is a percentile
+    bootstrap CI (Bruce, Bruce & Gedeck, Practical Statistics for Data Scientists, 2020) ; the
+    within-unit residual variant is the standard extension for clustered data. R equivalent:
+    permuco::lmperm (freedman_lane) for the p ; boot::boot for the band.
+    """
+    y = np.asarray(y, float); X = np.asarray(design, float); units = np.asarray(units)
+    G = np.asarray(predict_grid, float)
+    ix = int(effect_col)
+    b, *_ = np.linalg.lstsq(X, y, rcond=None); slope = float(b[ix])
+    fit_full = X @ b; resid_full = y - fit_full
+    keep = [j for j in range(X.shape[1]) if j != ix]; Xr = X[:, keep]
+    br, *_ = np.linalg.lstsq(Xr, y, rcond=None); fitr = Xr @ br; residr = y - fitr
+    uu = list(dict.fromkeys(units.tolist())); idx = [np.where(units == u)[0] for u in uu]
+    rng = np.random.RandomState(seed)
+    # Freedman-Lane permutation p (within-unit residual permutation)
+    cnt = 1
+    for _ in range(int(n_perm)):
+        rp = residr.copy()
+        for gi in idx:
+            pp = gi.copy(); rng.shuffle(pp); rp[gi] = residr[pp]
+        bp, *_ = np.linalg.lstsq(X, fitr + rp, rcond=None)
+        if abs(float(bp[ix])) >= abs(slope) - 1e-15:
+            cnt += 1
+    p = cnt / (int(n_perm) + 1)
+    # residual bootstrap band (within-unit resampling with replacement). Also the bootstrap CI of EVERY
+    # coefficient (forest bars), the resampling sibling of the band - the whole design in one pass.
+    # NB: raw OLS residuals are slightly shrunk (by 1-h_ii), so the band is mildly anti-conservative
+    # (conditional CI). A leverage rescaling r_i/sqrt(1-h_ii) (Wu 1986; Davidson & Flachaire 2008) would
+    # correct this - deliberately NOT applied, to keep the method within the wiki's referenced bootstrap.
+    preds = np.empty((int(n_boot), G.shape[0]))
+    coefs = np.empty((int(n_boot), X.shape[1]))
+    for bI in range(int(n_boot)):
+        rb = resid_full.copy()
+        for gi in idx:
+            rb[gi] = resid_full[rng.choice(gi, size=gi.size, replace=True)]
+        bb, *_ = np.linalg.lstsq(X, fit_full + rb, rcond=None)
+        preds[bI] = G @ bb; coefs[bI] = bb
+    return {"slope": slope, "p": p, "band_lo": np.percentile(preds, 2.5, axis=0),
+            "band_hi": np.percentile(preds, 97.5, axis=0), "yhat": G @ b,
+            "coef": b, "coef_lo": np.percentile(coefs, 2.5, axis=0),
+            "coef_hi": np.percentile(coefs, 97.5, axis=0), "n_perm": int(n_perm), "n_boot": int(n_boot)}
