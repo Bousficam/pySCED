@@ -1056,12 +1056,27 @@ def randomization_interval(labels, values, *, statistic, scheme, treated, confid
     guaranteed effect increasing either, and Fiksel's Theorem 1 (p. 3) gives a condition checkable
     on the observed data. No check is performed here : the statistic is a black box to this function.
 
-    FASTER ROUTE, not implemented. Where the statistic admits it, the inversion has a CLOSED FORM
-    (Zhu & Liu 2022 ; Fiksel 2024, p. 3) : the p-value only changes where a permuted statistic
-    crosses the observed one, so one solves for those crossing points, sorts them, and reads the
-    bounds as order statistics - one pass, measured at 8 per cent of the p-value's own cost, against
-    roughly 30x for the bisection used below (Fiksel 2024, p. 5, Table 1). This search is kept
-    because it accepts an arbitrary statistic and an arbitrary schedule ; it is the slow route.
+    THIS SEARCH IS THE SLOW ONE, and knowingly so. It runs a FULL randomization test (`n_perm`
+    draws) at every candidate, which is exactly the procedure Garthwaite (1996, Biometrics
+    52:1387-1393, p. 1387) calls unsophisticated and blames for the rarity of these intervals in
+    practice. Two better routes exist :
+
+      - ROBBINS-MONRO (Garthwaite 1996, p. 1388, Eq. 2.1-2.2) : draw ONE permutation per candidate
+        and step by c*alpha/i or c*(1-alpha)/i according to the side it falls on. Each step reduces
+        the expected distance to the endpoint, the sequence converges in probability to it (Blum
+        1954), and a whole endpoint costs "only slightly more permutations than the number needed
+        for a randomization test" - about 6000 steps where the naive search spends 5000 permutations
+        at each of seven candidates. Needs a step-length constant, starting values, a restart rule
+        and monitoring of the realised tail proportion.
+      - CLOSED FORM (Zhu & Liu 2022 ; Fiksel 2024, p. 3) where the statistic's crossing equation is
+        solvable : solve per permutation for the candidate at which the permuted statistic equals
+        the observed one, sort, read the bounds as order statistics. Measured at 8 per cent of the
+        p-value's own cost, against roughly 30x for bisection (Fiksel 2024, p. 5, Table 1).
+
+    The bisection is kept for now because it accepts an ARBITRARY statistic and an arbitrary
+    schedule, needs no tuning, and is deterministic given the seed. Its cost is `2 * n_candidates *
+    n_perm` statistic evaluations, which is fine for one scalar contrast and prohibitive at map
+    scale. Validated against Garthwaite's own published example, see tests.
 
     KNOWN LIMIT : the acceptance set need not be an interval. The reference set is finite, so p is
     a STEP function of the candidate and, with a two-sided |statistic| comparison, not necessarily

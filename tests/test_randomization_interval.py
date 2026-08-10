@@ -84,6 +84,28 @@ def test_the_bounds_sit_where_the_EXACT_p_crosses_alpha():
     assert _exhaustive_p(3.375 + (2.45 - 1.50496) * sd, sd) < 0.05
 
 
+def test_agrees_with_garthwaites_published_interval():
+    """Independent external check, on a second published worked example.
+
+    Garthwaite (1996, Biometrics 52:1387-1393, p. 1390) inverts the same test on lizard running
+    distances, 15 malaria-infected against 15 uninfected, by a Robbins-Monro search rather than by
+    the bisection used here, and reports theta_hat = 5.36 with a 95% CI of (-0.30, 10.69). Two
+    independent search procedures on the same printed data must land within their Monte-Carlo
+    error of each other; the point estimate must match exactly.
+    """
+    X = [16.4, 29.4, 37.1, 23.0, 24.1, 24.5, 16.4, 29.1, 36.7, 28.7, 30.2, 21.8, 37.1, 20.3, 28.3]
+    Y = [22.2, 34.8, 42.1, 32.9, 26.4, 30.6, 32.9, 37.5, 18.4, 27.5, 45.5, 34.0, 45.5, 24.5, 28.7]
+    v = np.array(X + Y, dtype=float)
+    t = np.array([False] * 15 + [True] * 15)          # treated = uninfected, theta = mu_Y - mu_X
+    r = randomization_interval(t, v, statistic=frozen_sd_statistic(v, t, standardize=False),
+                               scheme=alternating_scheme(), treated=t, n_perm=4000,
+                               random_state=0, confidence=0.95, precision=1e-3)
+    assert r["estimate"] == pytest.approx(5.36, abs=0.005)
+    assert r["ci_low"] == pytest.approx(-0.30, abs=0.4)
+    assert r["ci_high"] == pytest.approx(10.69, abs=0.4)
+    assert r["ci_low"] <= 0.0 <= r["ci_high"] and r["p_value"] > 0.05      # duality, barely
+
+
 def test_unstandardized_estimate_matches_the_paper():
     """Same data, raw mean difference: theta_obs = 3.375 (p. 365)."""
     r = randomization_interval(**_setup(standardize=False), confidence=0.95)
