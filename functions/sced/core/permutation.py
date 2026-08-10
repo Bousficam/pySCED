@@ -1034,6 +1034,24 @@ def randomization_interval(labels, values, *, statistic, scheme, treated, confid
     confidence, and this function raises rather than returning a bracket that means nothing -
     Michiels et al. (2017, p. 376) on the same arithmetic for AB designs.
 
+    CONSERVATIVE, NOT EXACT, at a round confidence level. The reference set is finite, so its
+    attainable p-values form a grid, and a requested alpha rarely lands on it. Ernst (2004,
+    Statistical Science 19(4):676-685, p. 680) : the interval is exact "if alpha is chosen as one
+    of the achievable p values in the randomization distribution", and "otherwise, they are
+    conservative intervals where the true coverage probability is at least as large as the chosen
+    confidence coefficient". Erring toward over-coverage, which is the safe direction, but a
+    reported "95 per cent" is a floor rather than an equality. Ernst quotes his own examples at
+    94.29 and 94.90 per cent rather than rounding, which is the honest habit here too.
+
+    THE TWO-SIDED CONVENTION is inherited from ``randomization_test``, which compares |statistic|
+    against |observed|, i.e. distance from ZERO. That matches the equal-tailed construction only
+    when the reference distribution is centred at zero, as it is for a difference in means under a
+    count-preserving relabeling. For a statistic whose null distribution is asymmetric or off-centre
+    it is the wrong measure of extremeness : "these distributions are not symmetric and so there is
+    no justification for doubling the probability in one tail", and the distance should be taken
+    from the MEAN of the reference distribution (Ernst 2004, p. 682). Not implemented ; a statistic
+    with an off-centre null should not be handed to this function as it stands.
+
     MONTE-CARLO NOISE. Every candidate is tested with the SAME generator seed, so two candidates
     differ by their data and not by their draws. With independent seeds the accept / reject
     boundary would jitter by the Monte-Carlo error of p and the reported bounds would not be
