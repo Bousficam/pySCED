@@ -69,8 +69,10 @@ def hierarchical_group_model(df, *, unit_col, session_col, condition_col, outcom
         values, labels, units, sessions, detrend=detrend, method=method, n_perm=n_perm,
         max_consecutive=max_consecutive, standardize=standardize,
         random_state=random_state)["p_value"]
+    # no max_consecutive here: the interaction null is necessarily residual-based
+    # (Freedman-Lane), so a schedule constraint cannot apply - see heterogeneity_test.
     het = heterogeneity_test(values, labels, units, sessions, conditions=conditions,
-                             detrend=detrend, n_perm=n_perm, max_consecutive=max_consecutive,
+                             detrend=detrend, n_perm=n_perm,
                              standardize=standardize, random_state=random_state)
     p_hetero = het["interaction_p"]
 
@@ -232,3 +234,54 @@ def hierarchical_group_model(df, *, unit_col, session_col, condition_col, outcom
                      "Explanation": mlm_note, "Interpretation": "permutation p valid."})
     sheet = pd.DataFrame(rows, columns=["Quantity", "Value", "Explanation", "Interpretation"])
     return summary, sheet
+
+
+def group_mixed_trend(df, *, unit_col, slope_col, outcome_col, condition_col=None,
+                      covariates=None, random_state=0):
+    """Group mixed model for a CONTINUOUS-slope random effect (time trend / within-session run),
+    the sibling of :func:`hierarchical_group_model` (which carries the random CONDITION slope). Fits
+    ``outcome ~ slope_col [+ C(condition)] [+ covariates] + (slope_col | unit)`` (falls back to a
+    random intercept if the random slope does not converge), for the SHRUNK per-patient trajectories
+    (BLUP), the ICC and the variance components. Estimates ONLY - as documented for this module the
+    p-values must come from permutation (perm_boot_slope_band / huh_jhun_test / group_adjusted_effects),
+    not the asymptotic p, at the small-cluster n of SCED.
+
+    Returns a dict : ``{model, fe_params, blup, icc, var_intercept, var_slope, var_resid,
+    has_random_slope, formula}`` where ``blup[unit] = {"intercept", "slope"}`` are the random-effect
+    deviations (add to the fixed effects for the patient-specific line).
+
+    References: multilevel models for replicated single-case designs - Van den Noortgate & Onghena
+    (2003) introduced the three-level HLM formulation; Moeyaert, Ferron, Beretvas & Van den Noortgate
+    (2014, doi:10.1016/j.jsp.2013.11.003) the multilevel analysis. Per this module's policy the mixed
+    model supplies the estimates only; the p-values come from permutation (perm_boot_slope_band /
+    huh_jhun_test). R equivalent: lme4::lmer(outcome ~ slope + cond + (slope|unit)).
+    """
+    terms = [slope_col] + ([f"C({condition_col})"] if condition_col else []) + list(covariates or [])
+    formula = f"{outcome_col} ~ " + " + ".join(terms)
+    d = df.dropna(subset=[outcome_col, slope_col, unit_col]).copy()
+    m = None; has_rs = True
+    for re_f in (f"~{slope_col}", "~1"):
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                m = smf.mixedlm(formula, d, groups=d[unit_col], re_formula=re_f).fit(reml=False)
+            has_rs = (re_f != "~1")
+            break
+        except Exception:
+            m = None
+    if m is None:
+        return {"model": None, "fe_params": {}, "blup": {}, "icc": np.nan, "var_intercept": np.nan,
+                "var_slope": np.nan, "var_resid": np.nan, "has_random_slope": False, "formula": formula}
+    cov_re = m.cov_re
+    var_int = float(cov_re.iloc[0, 0]) if cov_re.shape[0] else np.nan
+    var_slope = float(cov_re.loc[slope_col, slope_col]) if (has_rs and slope_col in cov_re.index) else np.nan
+    var_resid = float(m.scale)
+    icc = var_int / (var_int + var_resid) if np.isfinite(var_int) and (var_int + var_resid) > 0 else np.nan
+    blup = {}
+    for u, re_u in m.random_effects.items():
+        sl = float(re_u.get(slope_col, 0.0))
+        it = float([v for k, v in re_u.items() if k != slope_col][0]) if len(re_u) else 0.0
+        blup[str(u)] = {"intercept": it, "slope": sl}
+    return {"model": m, "fe_params": m.fe_params, "blup": blup, "icc": icc,
+            "var_intercept": var_int, "var_slope": var_slope, "var_resid": var_resid,
+            "has_random_slope": has_rs, "formula": formula}

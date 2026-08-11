@@ -17,7 +17,30 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.ticker import MaxNLocator, PercentFormatter
+from matplotlib.ticker import MaxNLocator, PercentFormatter, FuncFormatter
+
+
+def _session_int_axis(ax):
+    """Integer session x-ticks with an optional label offset (env SCED_SESSION_OFFSET, 0 = neutral)
+    and the post-intervention follow-up shown as 'M3' with an axis break before it. The follow-up
+    sits at data position SCED_N_STUDY (default 18 ; the 18 study sessions are index 0..17) : its tick
+    reads 'M3' and a faint separator + '//' glyph marks the break. Display only : the plotted data,
+    fits and statistics are untouched, only the tick LABELS and the break marker are added."""
+    import os
+    off = int(os.environ.get("SCED_SESSION_OFFSET", 0))
+    n_study = int(os.environ.get("SCED_N_STUDY", 18))
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+
+    def _fmt(v, _p):
+        i = int(round(v))
+        return "M3" if i == n_study else str(i + off)     # follow-up data position -> 'M3'
+    ax.xaxis.set_major_formatter(FuncFormatter(_fmt))
+    xb = n_study - 0.5                                     # break between S{n_study} (x=n-1) and M3
+    if ax.get_xlim()[1] >= n_study - 0.05:                # only when the follow-up is actually in view
+        tr = ax.get_xaxis_transform()
+        ax.axvline(xb, color="0.6", lw=0.8, ls=(0, (2, 2)), alpha=0.7, zorder=0)
+        ax.annotate("//", xy=(xb, 0), xycoords=tr, ha="center", va="center", fontsize=9, color="0.4",
+                    annotation_clip=False, bbox=dict(boxstyle="square,pad=0.02", fc="white", ec="none"))
 
 
 # TODO(SCED, structured visual analysis): the current plots show raw points + per-phase
@@ -46,7 +69,7 @@ def _panel(ax, g, session_col, condition_col, outcome_col, conditions, colors, t
             ax.axhline(y[m].mean(), color=colors[c], ls="--", lw=2, alpha=0.55, zorder=4)
     ax.set_title(title, fontsize=13)
     ax.grid(True, alpha=0.25)
-    ax.xaxis.set_major_locator(MaxNLocator(integer=True))           # sessions = integers
+    _session_int_axis(ax)           # sessions = integers
 
 
 def _panel_dist(ax, g, condition_col, outcome_col, conditions, colors, title, *,
@@ -217,7 +240,7 @@ def plot_sced_alternating(df, *, session_col, condition_col, outcome_col, unit_c
             ax = axes[i // ncols][i % ncols]
             _draw(ax, sub[sub[unit_col] == u], u)
             if kind == "series":
-                ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+                _session_int_axis(ax)
             if bounds is not None:
                 ax.set_ylim(bounds[0], bounds[1])                     # real scale of the outcome
             else:
@@ -765,7 +788,7 @@ def plot_mbd_pooled_fit(df, *, tier_col, session_col, outcome_col, starts, fit,
     ax.axvline(0, color=sty.color("intervention_line"), ls="--", lw=1.2, alpha=0.7, zorder=1)   # intervention
     ax.set_xlabel(sty.xlabel or "Time relative to intervention (sessions)")
     ax.set_ylabel(sty.ylabel or outcome_col)
-    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    _session_int_axis(ax)
     if bounds is not None:
         ax.set_ylim(bounds[0], bounds[1])
     if y_percent:
@@ -1155,3 +1178,158 @@ def plot_case_forest(labels, meds, los, his, *, pop=None, highlight=(), save_pat
     if save_path is not None:
         st.save(fig, save_path, fname or "forest", ax=ax)
     return fig
+
+
+# ---------------------------------------------------------------------------
+# Within-visit run view (3-level structure: run > visit > phase)
+# ---------------------------------------------------------------------------
+def _draw_intravisit_runs(ax, g, *, session_col, run_col, condition_col, outcome_col,
+                          conditions, colors, sty, gap, show_mean, show_trend,
+                          mean_label, trend_label, visit_label_offset=0):
+    """Draw ONE unit: raw runs laid out consecutively, grouped by visit with a small gap
+    between visits, points coloured by phase, plus a per-visit mean line (level 2) and a
+    within-visit OLS trend (level 1). Mutates ``ax``; returns the last global x index used.
+
+    Layout mirrors the clinical ``plot_raw_runs`` (Viz_df): each (visit, run) gets a global
+    integer x with ``gap`` blank slots between visits; xticks sit at each visit block centre.
+    Inference is NOT drawn here - this is the descriptive companion to the 3-level model
+    (functions.sced.intravisit), showing the run>visit>phase nesting the model decomposes.
+    """
+    g = g.copy()
+    g[session_col] = pd.to_numeric(g[session_col], errors="coerce")
+    # sort by visit then run so the within-visit order is the run order
+    if run_col in g.columns:
+        g["_run_ord"] = pd.to_numeric(g[run_col], errors="coerce")
+        g = g.sort_values([session_col, "_run_ord"], kind="stable")
+    else:
+        g = g.sort_values([session_col], kind="stable")
+    visits = [v for v in g[session_col].dropna().unique()]      # already in visit order
+    x_of_visit = {}                                             # visit -> array of global x
+    offset = 0
+    for v in visits:
+        n = int((g[session_col] == v).sum())
+        x_of_visit[v] = np.arange(offset, offset + n)
+        offset += n + gap
+
+    shown = set()
+    mean_done = trend_done = False
+    for v in visits:
+        sub = g[g[session_col] == v]
+        xs = x_of_visit[v]
+        ys = sub[outcome_col].astype(float).to_numpy()
+        phs = sub[condition_col].astype(str).to_numpy()
+        # thin per-phase connector (keeps the within-visit run trajectory readable)
+        for ph in np.unique(phs):
+            m = (phs == ph) & ~np.isnan(ys)
+            ax.plot(xs[m], ys[m], "-", color=colors.get(ph, "0.4"), lw=1.0, alpha=0.3, zorder=1)
+        # scatter each run, coloured by phase (label once per phase)
+        for xi, yi, ph in zip(xs, ys, phs):
+            lab = str(ph) if ph not in shown else None
+            ax.scatter(xi, yi, color=colors.get(ph, "0.4"), s=26, zorder=3,
+                       edgecolor="white", linewidth=0.4, label=lab)
+            shown.add(ph)
+        # level 2: per-visit mean (horizontal)
+        if show_mean and len(ys):
+            m = float(np.nanmean(ys))
+            ax.hlines(m, xs.min(), xs.max(), colors=sty.color("mean", "#1f77b4"),
+                      lw=1.6, alpha=0.75, zorder=2,
+                      label=(mean_label if not mean_done else None))
+            mean_done = True
+        # level 1: within-visit OLS trend (needs >= 2 finite points)
+        if show_trend:
+            mfin = ~np.isnan(ys)
+            if mfin.sum() >= 2:
+                c = np.polyfit(xs[mfin], ys[mfin], 1)
+                ax.plot(xs, np.poly1d(c)(xs), "-", color=sty.color("trend", "#d62728"),
+                        lw=1.6, alpha=0.75, zorder=2,
+                        label=(trend_label if not trend_done else None))
+                trend_done = True
+    # visit separators + centred visit ticks
+    for v in visits[:-1]:
+        ax.axvline(x_of_visit[v][-1] + (gap + 1) / 2.0 - 0.5, color="grey", lw=0.8, alpha=0.5)
+    ax.set_xticks([x_of_visit[v].mean() for v in visits])
+    # display label = visit value + offset (offset=1 turns a 0-based session index into 1-based)
+    ax.set_xticklabels([str(int(v) + visit_label_offset) if float(v).is_integer()
+                        else str(v) for v in visits])
+    if visits:
+        ax.set_xlim(x_of_visit[visits[0]][0] - 0.6, x_of_visit[visits[-1]][-1] + 0.6)
+    ax.grid(sty.grid, axis="y", alpha=sty.grid_alpha)
+    return offset
+
+
+def plot_intravisit_runs(df, *, unit_col=None, session_col, run_col, condition_col,
+                         outcome_col, units=None, conditions=None, show_mean=True,
+                         show_trend=True, gap=1, visit_label_offset=0, title=None,
+                         save_path=None, style=None):
+    """
+    Descriptive view of the **3-level within-visit structure** (run > visit > phase),
+    one figure PER unit. For each unit the runs are laid out consecutively along x,
+    grouped into visit blocks (a ``gap``-slot break between visits), points coloured by
+    phase; a per-visit mean line marks the **visit level (2)** and a within-visit OLS
+    line marks the **run level (1)**. This is the visual companion to the 3-level
+    randomization model in :mod:`functions.sced.intravisit` - it shows the nesting the
+    model decomposes, it does not itself carry inference.
+
+    Parameters mirror the toolbox convention (``unit_col`` = patient, ``session_col`` =
+    visit, ``run_col`` = repeated measure within a visit, ``condition_col`` = phase,
+    ``outcome_col`` = measured value). With ``unit_col=None`` the whole frame is one unit.
+    ``visit_label_offset`` is added to each numeric visit tick label (use ``1`` to show a
+    0-based session index as 1-based visits, e.g. ``0..17`` -> ``1..18``).
+
+    Returns a dict ``{unit: Figure}`` (single key ``None`` when ``unit_col`` is None). When
+    ``save_path`` is given each figure is saved as ``<outcome>_intravisit_runs_<unit>``.
+    """
+    from functions.common.plotstyle import resolve_style
+    sty = resolve_style(style)
+    if conditions is None:
+        conditions = sorted(df[condition_col].dropna().unique().tolist(), key=str)
+    palette = plt.get_cmap(sty.palette)(np.linspace(0, 1, max(10, len(conditions))))
+    colors = {c: sty.cond_color(c, palette[i]) for i, c in enumerate(conditions)}
+    colors.update({str(c): colors[c] for c in conditions})     # allow str-keyed lookup
+    mean_label = sty.label("visit_mean", "Visit mean")
+    trend_label = sty.label("within_visit_trend", "Within-visit trend")
+    sub = df[df[condition_col].isin(conditions)]
+
+    if unit_col is None:
+        unit_list = [None]
+    elif units is not None:
+        unit_list = list(units)
+    else:
+        unit_list = sorted(sub[unit_col].dropna().unique().tolist(), key=str)
+
+    sty.apply_rc()
+    figs = {}
+    for u in unit_list:
+        g = sub if u is None else sub[sub[unit_col] == u]
+        if g.empty:
+            continue
+        n_pts = len(g)
+        width = sty.figsize[0] if sty.figsize else max(9.0, n_pts * 0.13)
+        height = sty.figsize[1] if sty.figsize else 5.0
+        fig, ax = plt.subplots(figsize=(width, height))
+        _draw_intravisit_runs(ax, g, session_col=session_col, run_col=run_col,
+                              condition_col=condition_col, outcome_col=outcome_col,
+                              conditions=conditions, colors=colors, sty=sty, gap=gap,
+                              show_mean=show_mean, show_trend=show_trend,
+                              mean_label=mean_label, trend_label=trend_label,
+                              visit_label_offset=visit_label_offset)
+        ax.set_xlabel(sty.xlabel or "Visit")
+        ax.set_ylabel(sty.ylabel or outcome_col.replace("_", " ").capitalize())
+        ttl = sty.title or title or (
+            f"{outcome_col}: runs within visits" + (f" - {u}" if u is not None else ""))
+        ax.set_title(ttl, fontsize=sty.title_fs)
+        if sty.show_legend:
+            # order: phases, then mean, then trend
+            h, l = ax.get_legend_handles_labels()
+            by = dict(zip(l, h))
+            order = [c for c in map(str, conditions) if c in by]
+            order += [x for x in (mean_label, trend_label) if x in by]
+            ax.legend([by[k] for k in order], order, title=condition_col.capitalize(),
+                      **sty.legend_kw())
+        sty.format_axes(ax, x=False)                            # y only (x = visit labels)
+        fig.tight_layout()
+        if save_path is not None:
+            suffix = "" if u is None else f"_{u}"
+            sty.save(fig, save_path, f"{outcome_col}_intravisit_runs{suffix}", ax=ax)
+        figs[u] = fig
+    return figs

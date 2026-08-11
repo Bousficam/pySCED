@@ -10,7 +10,7 @@ templates can route inference identically from the same declaration.
 """
 import numpy as np
 
-from .spatial import spatial_freedman_lane, spatial_huh_jhun, spatial_contrast, spatial_relu
+from .spatial import spatial_freedman_lane, spatial_huh_jhun, spatial_contrast
 
 __all__ = ["term", "run_ancova"]
 
@@ -25,7 +25,6 @@ def term(name, values, *, role, kind, cond_order=None, dose=None, block_size=Non
             level ; requires cond_order, reference = cond_order[0]) ; 'ordered' (an ORDERED factor
             tested as ONE linear trend across the dose scores `dose` - a single multiplicity-free
             test, exact under the complete null, preferred over splitting an ordered dose into two
-            uncorrected dummy contrasts ; requires cond_order + dose) ; or 'hinge' (a relu
             change-point axis on `values` = time, always Freedman-Lane).
     dose  : ordered scores per cond_order level (e.g. [4, 5, 6]) for a 'ordered' factor.
     block_size / max_consecutive : the randomized term's schedule constraints (force / shape DS).
@@ -38,7 +37,7 @@ def term(name, values, *, role, kind, cond_order=None, dose=None, block_size=Non
 
 def _resolve_perm(t, terms):
     """Permutation method for a term, delegated to the UNIFIED dispatcher (core.recommend_scheme) so
-    DS/FL/HJ resolution lives in one place. Fixed / hinge -> Freedman-Lane here (a fixed covariate's
+    DS/FL/HJ resolution lives in one place. Fixed -> Freedman-Lane here (a fixed covariate's
     HJ grid is handled by _fixed_axis_grid, which also queries recommend_scheme for its primary).
     Randomized -> Draper-Stoneman, or Freedman-Lane when ``auto`` finds temporal collinearity."""
     if t["role"] != "randomized":
@@ -51,38 +50,40 @@ def _resolve_perm(t, terms):
                             sessions=sessions, detrend=detrend)["primary"]
 
 
-def run_ancova(Y, adjacency, terms, *, primary_p, n_perm, cluster_stat, tail, seed=0):
+def run_ancova(Y, adjacency, terms, *, primary_p, n_perm, cluster_stat, tail, seed=0,
+               stat=None, vg=None):
     """Run every ANCOVA axis declared by ``terms`` on the element map Y (n_obs, n_elements), each
     with the null adapted to its role and adjusting for all other terms. Returns
     (res_by_axis, clabel_by_axis, perm_by_axis). Axis names : a continuous term keeps its name ; a
-    factor term gives '<name>_<level>v<ref>' per contrast."""
+    factor term gives '<name>_<level>v<ref>' per contrast.
+
+    stat : None (defaut) laisse chaque axe garder sa statistique historique - 'auto' pour un terme
+           ordonne ou continu randomise, 't' pour un contraste de facteur, le t de la charniere pour
+           la grille {t, W} pour une covariable fixe. Une valeur explicite ('W',
+           'G') remplace cette statistique sur tous les axes ; pour la covariable fixe elle remplace
+           la cellule ROBUSTE de la grille, la cellule classique restant 't'.
+    vg   : etiquettes de groupe de variance par observation, transmises a la statistique de chaque
+           axe (utiles a 'G' seulement). Le blanchiment Huh-Jhun dissout ces groupes, aussi un `vg`
+           fourni bascule l'axe covariable fixe sur Freedman-Lane (cf. _fixed_axis_grid)."""
+    sv = {"vg": vg} if vg is not None else {}          # ne rien passer quand rien n'est demande
+    st = {} if stat is None else {"stat": stat}        # None = defaut propre a chaque axe
     res, clab, pm_by = {}, {}, {}
     for i, t in enumerate(terms):
-        # Nuisance = the other LINEAR terms only. A hinge term is a change-point model, NOT a linear
-        # covariate : its values (time) must not enter another axis's design (adjusting the trend for
-        # the hinge's time would be time-on-time collinearity and would kill the slope).
-        others = [x for j, x in enumerate(terms) if j != i and x["kind"] != "hinge"]
+        # Nuisance = the other terms.
+        others = [x for j, x in enumerate(terms) if j != i]
         nuis = [x["values"] for x in others]
         nuis_kind = ["discrete" if x["kind"] in ("factor", "ordered") else "continuous" for x in others]
         pm = _resolve_perm(t, terms)
         tag = "DS" if pm != "freedman-lane" else "FL"
-        if t["kind"] == "hinge":                            # relu change-point, adjusted for the others
-            ax = t["name"]
-            res[ax] = spatial_relu(Y, adjacency, t["values"], nuisance=nuis, nuisance_kind=nuis_kind,
-                                   adjust_time=False, primary_p=primary_p, n_perm=n_perm,
-                                   cluster_stat=cluster_stat, tail=tail, seed=seed)
-            res[ax]["effect"] = res[ax]["slope"]           # uniform effect key = the hinge slope
-            _tag_axis(res[ax], "hinge", "relu")            # family/kind travel with the result
-            clab[ax] = f"{t['name']} hinge slope /session post-onset [FL] (red = increase)"
-            pm_by[ax] = "freedman-lane"
-        elif t["kind"] == "ordered":                        # ordered factor -> ONE dose-linear trend
+        if t["kind"] == "ordered":                        # ordered factor -> ONE dose-linear trend
             ax = f"{t['name']}_dose"
             lut = dict(zip([str(c) for c in t["cond_order"]], t["dose"]))
             dose_vec = np.array([lut[str(v)] for v in t["values"]], dtype=float)
             res[ax] = spatial_freedman_lane(Y, adjacency, effect=dose_vec, nuisance=nuis,
                 effect_kind="continuous", nuisance_kind=nuis_kind, perm_method=pm,
                 block_size=t["block_size"], max_consecutive=t["max_consecutive"],
-                primary_p=primary_p, n_perm=n_perm, cluster_stat=cluster_stat, tail=tail, seed=seed)
+                primary_p=primary_p, n_perm=n_perm, cluster_stat=cluster_stat, tail=tail, seed=seed,
+                **st, **sv)
             _tag_axis(res[ax], "ordered", t["name"])
             clab[ax] = f"{t['name']} dose slope /step [{tag}] (red = increase)"; pm_by[ax] = pm
         elif t["kind"] == "factor":
@@ -92,13 +93,15 @@ def run_ancova(Y, adjacency, terms, *, primary_p, n_perm, cluster_stat, tail, se
                 res[ax] = spatial_contrast(Y, adjacency, factor=t["values"], contrast=c,
                     cond_order=t["cond_order"], nuisance=nuis, nuisance_kind=nuis_kind, perm_method=pm,
                     block_size=t["block_size"], max_consecutive=t["max_consecutive"],
-                    primary_p=primary_p, n_perm=n_perm, cluster_stat=cluster_stat, tail=tail, seed=seed)
+                    primary_p=primary_p, n_perm=n_perm, cluster_stat=cluster_stat, tail=tail, seed=seed,
+                    **st, **sv)
                 _tag_axis(res[ax], "factor", t["name"])    # all contrasts of a factor share its family
                 clab[ax] = f"{c}-{ref} contrast [{tag}] (red = higher at {c})"; pm_by[ax] = pm
         elif t["role"] == "fixed":                          # fixed covariate (trend) -> robust grid
             ax = t["name"]
             res[ax] = _fixed_axis_grid(Y, adjacency, t["values"], nuis, nuis_kind,
-                primary_p=primary_p, n_perm=n_perm, cluster_stat=cluster_stat, tail=tail, seed=seed)
+                primary_p=primary_p, n_perm=n_perm, cluster_stat=cluster_stat, tail=tail, seed=seed,
+                stat=stat, vg=vg)
             _tag_axis(res[ax], "continuous", t["name"])
             sch = res[ax].get("scheme", "huh-jhun")          # primary scheme from recommend_scheme (HJ/FL)
             lab = "HJ" if sch == "huh-jhun" else "FL"
@@ -109,14 +112,15 @@ def run_ancova(Y, adjacency, terms, *, primary_p, n_perm, cluster_stat, tail, se
             res[ax] = spatial_freedman_lane(Y, adjacency, effect=t["values"], nuisance=nuis,
                 effect_kind="continuous", nuisance_kind=nuis_kind, perm_method=pm,
                 block_size=t["block_size"], max_consecutive=t["max_consecutive"],
-                primary_p=primary_p, n_perm=n_perm, cluster_stat=cluster_stat, tail=tail, seed=seed)
+                primary_p=primary_p, n_perm=n_perm, cluster_stat=cluster_stat, tail=tail, seed=seed,
+                **st, **sv)
             _tag_axis(res[ax], "continuous", t["name"])
             clab[ax] = f"{t['name']} slope /session [{tag}] (red = increase)"; pm_by[ax] = pm
     return res, clab, pm_by
 
 
 def _fixed_axis_grid(Y, adjacency, effect, nuis, nuis_kind, *, primary_p, n_perm, cluster_stat,
-                     tail, seed):
+                     tail, seed, stat=None, vg=None):
     """A FIXED nuisance-adjusted covariate (e.g. the time trend) : run the
     {Freedman-Lane, Huh-Jhun} x {F/t, W} grid and keep HUH-JHUN + W as the PRIMARY result - best
     small-n type I control (exact-exchangeability whitening) plus heteroscedasticity robustness
@@ -131,28 +135,43 @@ def _fixed_axis_grid(Y, adjacency, effect, nuis, nuis_kind, *, primary_p, n_perm
     The PRIMARY scheme (HJ at small n, else FL) is decided by the unified dispatcher
     core.recommend_scheme - the SAME rule the randomized terms route through - so scheme choice is
     centralised, not hard-coded here ; the grid always runs both schemes, recommend_scheme only
-    picks which cell is the headline. Paired with the robust W statistic."""
+    picks which cell is the headline. Paired with the robust W statistic.
+
+    ``stat`` remplace la cellule ROBUSTE de la grille (W par defaut) ; la cellule classique reste
+    't'/'F', pour que la comparaison garde son sens. ``vg`` ne concerne que la cellule
+    Freedman-Lane : le blanchiment Huh-Jhun remplace les observations par des combinaisons
+    lineaires de toutes les lignes, ou un etiquetage defini sur les observations n'a plus de
+    correspondant. Un ``vg`` fourni fixe donc le schema primaire a Freedman-Lane, faute de quoi le
+    resultat de tete ignorerait en silence les groupes de variance demandes."""
     from .core import breusch_pagan_map, _fl_design
     from ..core import recommend_scheme
     prim_scheme = recommend_scheme(role="fixed", kind="continuous",
                                    n=int(np.asarray(effect).shape[0]))["primary"]   # HJ (small n) vs FL
+    robust = "W" if stat is None else stat             # cellule robuste de la grille
+    cells = tuple(dict.fromkeys(("t", robust)))        # dedoublonne si l'appelant demande 't'
+    if vg is not None:
+        prim_scheme = "freedman-lane"                  # HJ ne sait pas porter les groupes de variance
     prim, sens = None, []
     for scheme, fn in (("freedman-lane", spatial_freedman_lane), ("huh-jhun", spatial_huh_jhun)):
-        for st in ("t", "W"):
+        for st in cells:
+            kw = {"vg": vg} if (vg is not None and scheme == "freedman-lane") else {}
             r = fn(Y, adjacency, effect=effect, nuisance=nuis, effect_kind="continuous",
                    nuisance_kind=nuis_kind, stat=st, primary_p=primary_p, n_perm=n_perm,
-                   cluster_stat=cluster_stat, tail=tail, seed=seed)
+                   cluster_stat=cluster_stat, tail=tail, seed=seed, **kw)
             mp = min(r["comp_pvals"].values()) if r["comp_pvals"] else 1.0
-            sens.append({"scheme": scheme, "stat": ("W" if st == "W" else "F"),
+            # 'vg' dit si la cellule a bien porte les groupes de variance demandes : une cellule
+            # Huh-Jhun ne le peut pas, et une statistique 'G' sans groupe est exactement F, ce que
+            # le seul nom de la statistique laisserait croire acquis.
+            sens.append({"scheme": scheme, "stat": ("F" if st == "t" else st),
                          "min_p": float(mp), "n_sig": int(r["sig_elements"].sum()),
-                         "n_clusters": len(r["comp_pvals"])})
-            if scheme == prim_scheme and st == "W":                # primary = recommended scheme + robust W
+                         "n_clusters": len(r["comp_pvals"]), "vg": bool(kw)})
+            if scheme == prim_scheme and st == robust:            # primary = recommended scheme + robust cell
                 prim = r
     design, _tc, _nc, _st = _fl_design(Y, effect, nuis, "continuous", nuis_kind, "t")
     prim["sensitivity"] = sens
     prim["homoscedasticity"] = breusch_pagan_map(Y, design, sig_mask=prim["sig_elements"])
     prim["scheme"] = prim_scheme
-    prim["stat_kind"] = "W"
+    prim["stat_kind"] = robust
     return prim
 
 

@@ -145,10 +145,23 @@ def phase_design_test(df, *, session_col, outcome_col, phase_col, unit_col=None,
 
     adm = {u: _admissible_cuts(len(series[u]), len(phases), min_len) for u in units}
     for u in units:
-        if obs_cuts[u] not in adm[u]:
-            adm[u] = sorted(set(adm[u]) | {obs_cuts[u]})    # the realised split is admissible
         if not adm[u]:
             raise ValueError(f"No admissible split (unit={u}).")
+        if obs_cuts[u] not in adm[u]:
+            # The realised split violates the design's own min_len. Silently adding it to the
+            # admissible set (the former behaviour) inflated the denominator by one per unit
+            # while still reporting exact=True, and an aberrant one-session phase produces an
+            # extreme contrast that then lands on the p-floor - a data error that reads as a
+            # strong result. Either min_len does not describe the randomisation window that was
+            # pre-specified, or the phase labels are wrong; both must be fixed by the analyst.
+            lengths = [b - a for a, b in zip((0,) + obs_cuts[u],
+                                             obs_cuts[u] + (len(series[u]),))]
+            raise ValueError(
+                f"Unit {u}: the observed change points {obs_cuts[u]} give phase lengths "
+                f"{lengths}, which violate min_len={min_len}, so the observed split is NOT in "
+                "the admissible set the test compares it against. Set min_len to the minimum "
+                "phase length actually pre-specified in the randomisation window, or correct "
+                f"the phase labels in '{phase_col}'.")
 
     def combined_stat(choice):
         vals = [_series_stat(series[u], choice[u], phases, set(baseline), sign, statistic)
@@ -157,8 +170,17 @@ def phase_design_test(df, *, session_col, outcome_col, phase_col, unit_col=None,
         return float(np.mean(vals)) if vals else np.nan
 
     obs = combined_stat(obs_cuts)
-
     total = int(np.prod([len(adm[u]) for u in units]))
+    floor = 1.0 / (total + 1)
+    if not np.isfinite(obs):
+        # An undefined observed statistic must NOT be reported as the most significant value:
+        # the exact branch below would divide a zero count by `total` and return p = 0.0 with
+        # exact=True. Same guard as randomization_test.
+        return {"observed": float(obs), "p_value": float("nan"), "n_eval": 0, "exact": False,
+                "statistic": statistic, "phases": list(phases), "n_units": len(units),
+                "m_t": total, "p_floor": float(f"{floor:.3g}"),
+                "note": "observed statistic undefined (NaN) - all-missing or degenerate series"}
+
     exact = total <= enumerate_cap
     rng = np.random.RandomState(random_state)
     ge = 0
@@ -178,7 +200,14 @@ def phase_design_test(df, *, session_col, outcome_col, phase_col, unit_col=None,
 
     return {"observed": round(float(obs), 4), "p_value": round(float(p), 4),
             "n_eval": int(n_eval), "exact": bool(exact), "statistic": statistic,
-            "phases": list(phases), "n_units": len(units)}
+            "phases": list(phases), "n_units": len(units),
+            # DESIGN reference set, distinct from the Monte-Carlo resolution: m_t is the number
+            # of admissible change-point combinations and 1/(m_t+1) the smallest attainable p.
+            # A floor above alpha means the design cannot reach significance whatever the
+            # effect (Heyvaert & Onghena 2014; Levin et al. 2016).
+            "m_t": total, "p_floor": float(f"{floor:.3g}"),
+            "p_floor_note": ("floor above 0.05: this design cannot reach significance"
+                             if floor > 0.05 else "floor below 0.05")}
 
 
 def phase_glossary():

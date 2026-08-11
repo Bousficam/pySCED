@@ -14,50 +14,69 @@ Element-space twins of the network (NBS) wrappers, over the same shared engine
 import numpy as np
 
 from .core import (adjacency_components, _glm_statmap, cluster_run, _fl_design, huh_jhun_whiten, build_scheme,
-                   relu_run, _contrast_design, build_contrast_scheme, _term_matrix)
+                   _contrast_design, build_contrast_scheme, _term_matrix, tfce_e_for)
 
 __all__ = ["spatial_glm", "spatial_trend", "spatial_freedman_lane", "spatial_huh_jhun",
-           "spatial_relu", "spatial_contrast"]
+           "spatial_contrast"]
 
 
 def spatial_glm(Y, design, test_cols, adjacency, *, nuisance_cols=None, stat="F",
                 thresh=None, primary_p=0.001, n_perm=1000, alpha=0.05, tail="both",
-                seed=0, cluster_stat="size", scheme=None, ds_labels=None, restat=None):
+                seed=0, cluster_stat="size", scheme=None, ds_labels=None, restat=None,
+                vg=None, blocks=None, exchange="within", units=None):
     """Cluster-based-permutation GLM on ELEMENTS (e.g. electrode x frequency cells).
 
     Same per-element GLM statistic, threshold and permutation null as nbs_glm (Freedman-Lane
     by default, or a design-based randomization schedule via scheme / ds_labels / restat), but
     the clustering uses a generic sparse `adjacency` instead of the edge graph. Returns the
     cluster_run keys ; 'sig_edges' is the significant-element mask (aliased 'sig_elements').
+
+    stat / vg : la statistique elementaire et ses groupes de variance, transmis tels quels a
+    _glm_statmap. Defauts inchanges ('F', aucun groupe), donc un appel qui ne les precise pas
+    donne le meme resultat qu'avant leur introduction.
+
+    blocks / exchange / units : les blocs d'echangeabilite (Winkler et al. 2014, 2015), transmis a
+    cluster_run. INDISPENSABLES des que Y empile plusieurs sujets : la permutation libre par defaut
+    suppose une seule source d'erreur et rend le test anticonservateur. Voir core.block_permuter.
+    Avec 'G', Winkler impose que `vg` ne soit pas plus fin que l'ensemble echangeable.
     """
     statmap, effmap, Yv, Z, pZ, thr, signed = _glm_statmap(Y, design, test_cols, nuisance_cols,
-                                                           stat, thresh, primary_p)
+                                                           stat, thresh, primary_p, vg)
     # adjacency_components indexes the matrix (adjacency[idx][:, idx]), which needs a
     # subscriptable format ; combine_adjacency / find_ch_adjacency may hand back COO. Coerce
     # to CSR ONCE here (not per permutation) so any input format works.
     if hasattr(adjacency, "tocsr"):
         adjacency = adjacency.tocsr()
+    # TFCE only : pick the extent exponent E from this adjacency's dimensionality (chain -> 1D E=1 ;
+    # spatial/spectral lattice -> 2D E=2/3). No effect on the fixed-threshold path.
+    tfce_e = tfce_e_for(adjacency) if (isinstance(thr, str) and thr == "TFCE") else None
     res = cluster_run(statmap, Yv, Z, pZ, lambda m: adjacency_components(m, adjacency),
                       thresh=thr, signed=signed, tail=tail, n_perm=n_perm, alpha=alpha,
                       seed=seed, cluster_stat=cluster_stat,
-                      scheme=scheme, ds_labels=ds_labels, restat=restat)
+                      scheme=scheme, ds_labels=ds_labels, restat=restat, tfce_e=tfce_e,
+                      blocks=blocks, exchange=exchange, units=units)
     res["sig_elements"] = res["sig_edges"]
     res["effect"] = effmap(Yv)                             # per-element coefficient (slope / contrast)
     return res
 
 
 def spatial_trend(effects, adjacency, session_idx=None, t_thresh=2.5, primary_p=None, n_perm=1000,
-                  alpha=0.05, tail="both", seed=0, method="pearson", cluster_stat="size"):
+                  alpha=0.05, tail="both", seed=0, method="pearson", cluster_stat="size",
+                  stat=None, vg=None):
     """Sensor clusters whose per-element effect trends across sessions (design [1, time]).
     effects : (n_sessions, n_elements). method 'pearson' | 'spearman' (rank). Primary threshold :
     `primary_p` (per-element p, converted to the t threshold at the right df) takes precedence over
-    the raw `t_thresh`."""
+    the raw `t_thresh`.
+
+    stat : None (defaut) laisse `method` decider comme avant ('spearman' -> 'rank', sinon 't') ;
+           une valeur explicite ('W', 'G') l'emporte sur `method`.
+    vg   : groupes de variance transmis a _glm_statmap (utile a 'G')."""
     effects = np.asarray(effects, dtype=float)
     S = effects.shape[0]
     x = np.arange(S, dtype=float) if session_idx is None else np.asarray(session_idx, float)
     design = np.column_stack([np.ones(S), x])
-    res = spatial_glm(effects, design, [1], adjacency, nuisance_cols=[0],
-                      stat="rank" if method == "spearman" else "t",
+    st = ("rank" if method == "spearman" else "t") if stat is None else stat
+    res = spatial_glm(effects, design, [1], adjacency, nuisance_cols=[0], stat=st, vg=vg,
                       thresh=(None if primary_p is not None else t_thresh), primary_p=(primary_p or 0.001),
                       n_perm=n_perm, alpha=alpha, tail=tail, seed=seed, cluster_stat=cluster_stat)
     res["t"] = res["stat"]
@@ -67,23 +86,33 @@ def spatial_trend(effects, adjacency, session_idx=None, t_thresh=2.5, primary_p=
 def spatial_freedman_lane(Y, adjacency, *, effect, nuisance, effect_kind="auto",
                           nuisance_kind="auto", stat="auto", thresh=None, primary_p=0.001,
                           n_perm=1000, alpha=0.05, tail="both", seed=0, cluster_stat="size",
-                          perm_method="freedman-lane", block_size=None, max_consecutive=None):
+                          perm_method="freedman-lane", block_size=None, max_consecutive=None,
+                          vg=None, blocks=None, exchange="within", units=None):
     """Sensor clusters with the partial effect of one term adjusted for nuisance terms.
     Element-space twin of nbs_freedman_lane : Y (n_obs, n_elements), same term semantics.
 
     Permutation null : Freedman-Lane (default) or a design-based randomization schedule when
     the effect is a randomized factor with a constrained schedule (``block_size`` /
     ``max_consecutive`` force the shared alternating_scheme / block_scheme, so the reference
-    set matches the assignment). Same semantics as nbs_freedman_lane."""
+    set matches the assignment). Same semantics as nbs_freedman_lane.
+
+    stat : 'auto' (defaut) est resolu par _fl_design en 't' (effet a une colonne) ou 'F' (facteur a
+           plusieurs colonnes) ; 'W' et 'G' traversent _fl_design intacts et designent alors la
+           statistique elementaire de _glm_statmap.
+    vg   : groupes de variance par observation, transmis a la carte observee ET au recalcul de
+           chaque relabelisation Draper-Stoneman, pour que les deux emploient la meme statistique.
+
+    blocks / exchange / units : blocs d'echangeabilite, transmis a spatial_glm puis a cluster_run."""
     design, test_cols, nuis_cols, stat = _fl_design(Y, effect, nuisance, effect_kind,
                                                     nuisance_kind, stat)
     scheme, ds_labels, restat = build_scheme(Y, effect, nuisance, effect_kind, nuisance_kind,
                                              stat, test_cols, nuis_cols, thresh, primary_p,
-                                             perm_method, block_size, max_consecutive)
-    res = spatial_glm(Y, design, test_cols, adjacency, nuisance_cols=nuis_cols, stat=stat,
+                                             perm_method, block_size, max_consecutive, vg)
+    res = spatial_glm(Y, design, test_cols, adjacency, nuisance_cols=nuis_cols, stat=stat, vg=vg,
                       thresh=thresh, primary_p=primary_p, n_perm=n_perm, alpha=alpha,
                       tail=tail, seed=seed, cluster_stat=cluster_stat,
-                      scheme=scheme, ds_labels=ds_labels, restat=restat)
+                      scheme=scheme, ds_labels=ds_labels, restat=restat,
+                      blocks=blocks, exchange=exchange, units=units)
     res["stat_kind"] = stat
     res["F" if stat == "F" else "t"] = res["stat"]
     if stat == "F":
@@ -93,7 +122,7 @@ def spatial_freedman_lane(Y, adjacency, *, effect, nuisance, effect_kind="auto",
 
 def spatial_huh_jhun(Y, adjacency, *, effect, nuisance, effect_kind="auto", nuisance_kind="auto",
                      stat="W", thresh=None, primary_p=0.001, n_perm=1000, alpha=0.05, tail="both",
-                     seed=0, cluster_stat="size"):
+                     seed=0, cluster_stat="size", vg=None):
     """Huh-Jhun (2001) whitened permutation test - the exact-exchangeability sibling of
     spatial_freedman_lane, for a FIXED nuisance-adjusted covariate. Projects the data onto an
     orthonormal basis Q of the orthogonal complement of the nuisance space (Q'Q = I, Q Q' = I - H_Z),
@@ -107,17 +136,28 @@ def spatial_huh_jhun(Y, adjacency, *, effect, nuisance, effect_kind="auto", nuis
     stays interpretable in the original units. Same term semantics as spatial_freedman_lane ; the
     default stat is the robust W (the recommended HJ+W combination). Not for a randomized factor -
     use spatial_contrast (Draper-Stoneman) there ; the randomization, not exchangeability, is the
-    reference set for a randomized term."""
+    reference set for a randomized term.
+
+    vg : groupes de variance, exprimes dans l'espace BLANCHI. Le blanchiment remplace les n
+         observations par m = n - rang(Z) combinaisons lineaires de TOUTES les lignes : un
+         etiquetage defini sur les observations d'origine n'y a plus de correspondant, aussi un
+         `vg` de longueur n est refuse plutot que reinterprete en silence. Defaut None (aucun
+         groupe), donc 'G' s'y reduit a F comme auparavant."""
     w, Xw, stat = huh_jhun_whiten(Y, effect, nuisance, effect_kind, nuisance_kind, stat)  # shared HJ core
     if hasattr(adjacency, "tocsr"):
         adjacency = adjacency.tocsr()
+    if vg is not None and len(np.asarray(vg)) != w.shape[0]:
+        raise ValueError("spatial_huh_jhun : vg doit etre exprime dans l'espace blanchi "
+                         f"({w.shape[0]} lignes), pas sur les {np.asarray(Y).shape[0]} "
+                         "observations d'origine")
     # Whitened space has NO intercept / nuisance (projected out) : model w = Xw beta + e, so the
     # cluster_run FL branch (scheme=None, empty Z) permutes the m whitened rows = the HJ null.
     statmap, effmap, wv, Zw, pZw, thr, signed = _glm_statmap(
-        w, Xw, list(range(Xw.shape[1])), [], stat, thresh, primary_p)
+        w, Xw, list(range(Xw.shape[1])), [], stat, thresh, primary_p, vg)
+    tfce_e = tfce_e_for(adjacency) if (isinstance(thr, str) and thr == "TFCE") else None
     res = cluster_run(statmap, wv, Zw, pZw, lambda m_: adjacency_components(m_, adjacency),
                       thresh=thr, signed=signed, tail=tail, n_perm=n_perm, alpha=alpha,
-                      seed=seed, cluster_stat=cluster_stat)
+                      seed=seed, cluster_stat=cluster_stat, tfce_e=tfce_e)
     res["sig_elements"] = res["sig_edges"]
     res["effect"] = effmap(wv)                         # = ANCOVA-adjusted slope (FWL), interpretable
     res["stat_kind"] = stat
@@ -129,7 +169,8 @@ def spatial_huh_jhun(Y, adjacency, *, effect, nuisance, effect_kind="auto", nuis
 def spatial_contrast(Y, adjacency, *, factor, contrast, cond_order, nuisance, nuisance_kind="continuous",
                      perm_method="draper-stoneman", block_size=None, max_consecutive=None,
                      thresh=None, primary_p=0.001, n_perm=1000, alpha=0.05, tail="both", seed=0,
-                     cluster_stat="size"):
+                     cluster_stat="size", stat="t", vg=None,
+                     blocks=None, exchange="within", units=None):
     """Cluster test of ONE ANCOVA contrast (``contrast`` level minus the reference cond_order[0])
     within a RANDOMIZED factor, adjusting for ``nuisance`` (e.g. time) and the other levels.
 
@@ -138,52 +179,27 @@ def spatial_contrast(Y, adjacency, *, factor, contrast, cond_order, nuisance, nu
     unlike a free permutation of the binary contrast dummy. Falls back to Freedman-Lane residual
     permutation of the same design when ``perm_method='freedman-lane'`` and no schedule constraint
     is set. Element space (generic adjacency). Returns the cluster_run keys + 'effect' (the signed
-    contrast estimate) and 'sig_elements'."""
+    contrast estimate) and 'sig_elements'.
+
+    stat : la colonne testee est unique (la muette du contraste), donc 't' (defaut) est le t signe
+           habituel ; 'W' ou 'G' le remplacent par le Wald robuste ou le G de Winkler, tous deux
+           signes eux aussi a une colonne, sans rien changer au design ni au nul.
+    vg   : groupes de variance transmis a la carte observee et au recalcul de chaque relabelisation
+           Draper-Stoneman.
+
+    blocks / exchange / units : blocs d'echangeabilite, transmis a spatial_glm puis a cluster_run."""
     design, test_cols, nuis_cols = _contrast_design(Y, factor, contrast, cond_order,
                                                     nuisance, nuisance_kind)
     design_based = (perm_method in ("draper-stoneman", "randomization")
                     or block_size is not None or max_consecutive is not None)
     if design_based:
         scheme, ds_labels, restat = build_contrast_scheme(Y, factor, contrast, cond_order, nuisance,
-            nuisance_kind, perm_method, block_size, max_consecutive, thresh, primary_p)
+            nuisance_kind, perm_method, block_size, max_consecutive, thresh, primary_p, stat, vg)
     else:
         scheme = ds_labels = restat = None
-    res = spatial_glm(Y, design, test_cols, adjacency, nuisance_cols=nuis_cols, stat="t",
+    res = spatial_glm(Y, design, test_cols, adjacency, nuisance_cols=nuis_cols, stat=stat, vg=vg,
                       thresh=thresh, primary_p=primary_p, n_perm=n_perm, alpha=alpha, tail=tail,
                       seed=seed, cluster_stat=cluster_stat, scheme=scheme, ds_labels=ds_labels,
-                      restat=restat)
+                      restat=restat, blocks=blocks, exchange=exchange, units=units)
     res["t"] = res["stat"]
-    return res
-
-
-def spatial_relu(Y, adjacency, time, *, nuisance=None, nuisance_kind="auto", onsets=None,
-                 adjust_time=False, t_thresh=None, primary_p=0.001, n_perm=1000, alpha=0.05,
-                 tail="both", seed=0, cluster_stat="size"):
-    """Sensor / element clusters that APPEAR / bend at an UNKNOWN onset (relu / hinge change-point).
-
-    Element-space twin of nbs_relu : Y (n_obs, n_elements) + a generic `adjacency`. Per-element
-    statistic = sup over candidate onsets of the hinge partial t ; cluster FWER via Freedman-Lane
-    (the breakpoint search is absorbed by the permutation). The reduced model is [1, (time if
-    adjust_time), nuisance...]: pass `nuisance` (terms + nuisance_kind, like spatial_freedman_lane)
-    to adjust the onset for ARBITRARY covariates (e.g. a phase factor), keeping it consistent with
-    an ANCOVA - the hinge then tests a temporal bend not explained by the covariates. Returns the
-    cluster_run keys + 'onsets', 'onset'/'slope', 'onset_hat'/'slope_hat', 'sig_elements'."""
-    n = np.asarray(Y).shape[0]
-    cols = [np.ones((n, 1))]
-    if adjust_time:
-        cols.append(np.asarray(time, dtype=float)[:, None])
-    if nuisance is not None:                            # arbitrary covariates in the reduced model
-        terms = list(nuisance) if isinstance(nuisance, (list, tuple)) else [nuisance]
-        kinds = (list(nuisance_kind) if isinstance(nuisance_kind, (list, tuple))
-                 else [nuisance_kind] * len(terms))
-        for tm, k in zip(terms, kinds):
-            cols.append(_term_matrix(tm, k)[0])
-    Z = np.hstack(cols)
-    if hasattr(adjacency, "tocsr"):                    # adjacency_components needs a CSR (indexable)
-        adjacency = adjacency.tocsr()
-    res = relu_run(Y, time, lambda m: adjacency_components(m, adjacency), Z=Z,
-                   onsets=onsets, adjust_time=adjust_time, t_thresh=t_thresh, primary_p=primary_p,
-                   n_perm=n_perm, alpha=alpha, tail=tail, seed=seed, cluster_stat=cluster_stat)
-    res["t"] = res["stat"]
-    res["sig_elements"] = res["sig_edges"]
     return res

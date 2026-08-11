@@ -76,6 +76,10 @@ class PlotStyle:
     band_alpha: float = 0.18          # opacity of HDI / 95% CI bands
     band_hatch: str = None            # band hatching (e.g. "////") for B&W printing (None = solid fill)
     integer_ticks: bool = False       # force integer ticks (both x AND y)
+    session_offset: int = field(default_factory=lambda: int(__import__("os").environ.get("SCED_SESSION_OFFSET", 0)))
+    #                                   added to the session x-tick LABELS (display only ; data/fits
+    #                                   stay as-is). 1 -> a 0-based session index reads 1..N. Env
+    #                                   SCED_SESSION_OFFSET sets the default so a study can flip it globally.
     decimal_comma: bool = False       # French decimal separator (comma) on the axes
     show_legend: bool = True
     legend_loc: str = "best"          # legend location (matplotlib loc)
